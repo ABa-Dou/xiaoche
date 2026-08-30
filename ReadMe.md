@@ -1,0 +1,26 @@
+LF:2
+PWM  PA8
+IN1  PC0
+IN2  PC1
+ENC  PA5 PA1
+
+RF:1
+PWM  PE5
+IN1  PC2
+IN2  PC3
+ENC  PA6 PA7
+
+LR:4
+PWM  PF6
+IN1  PC4
+IN2  PC5
+ENC  PD12 PD13
+
+RR:3
+PWM  PF8
+IN1  PD2
+IN2  PG11
+ENC  PC6 PC7
+
+
+RF  pid kp=8.5 ki=4.0 kd=0.0 ff=1.1 tgt=175.0 ilim=50 sep=50.0 flt=0.30

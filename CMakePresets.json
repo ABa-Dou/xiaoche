@@ -1,0 +1,23 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "build",
+            "displayName": "STM32F407 GCC Build",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "toolchainFile": "${sourceDir}/cmake/arm-none-eabi.cmake"
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "build",
+            "configurePreset": "build"
+        },
+        {
+            "name": "rebuild",
+            "configurePreset": "build",
+            "cleanFirst": true
+        }
+    ]
+}
