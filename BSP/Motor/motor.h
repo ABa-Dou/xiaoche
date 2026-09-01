@@ -16,7 +16,7 @@
 #define __MOTOR_H
 
 #include "sys.h"
-
+#include "easy_log.h"
 typedef enum {
     MOTOR_LF = 0,
     MOTOR_RF,

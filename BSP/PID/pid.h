@@ -40,6 +40,7 @@ typedef struct {
     float output_limit;            /* 输出限幅 (PWM units) */
     float integral_separation_err; /* 积分分离阈值 (mm/s) */
 
+    //用于打印输出调试
     float p_out;       /* P 分量 (PWM units) */
     float i_out;       /* I 分量 (PWM units) */
     float d_out;       /* D 分量 (PWM units) */

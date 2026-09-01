@@ -24,3 +24,5 @@ ENC  PC6 PC7
 
 
 RF  pid kp=8.5 ki=4.0 kd=0.0 ff=1.1 tgt=175.0 ilim=50 sep=50.0 flt=0.30
+
+PD6 PD5
