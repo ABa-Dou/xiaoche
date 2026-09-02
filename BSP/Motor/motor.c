@@ -368,11 +368,11 @@ void motor_set_speed(motor_id_t id, int16_t speed)
     {
     case MOTOR_LF:
         if(speed > 0){
-            HAL_GPIO_WritePin(LF_IN1_PORT, LF_IN1_PIN, GPIO_PIN_RESET);
-            HAL_GPIO_WritePin(LF_IN2_PORT, LF_IN2_PIN, GPIO_PIN_SET);
-        }else if(speed < 0){
             HAL_GPIO_WritePin(LF_IN1_PORT, LF_IN1_PIN, GPIO_PIN_SET);
             HAL_GPIO_WritePin(LF_IN2_PORT, LF_IN2_PIN, GPIO_PIN_RESET);
+        }else if(speed < 0){
+            HAL_GPIO_WritePin(LF_IN1_PORT, LF_IN1_PIN, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(LF_IN2_PORT, LF_IN2_PIN, GPIO_PIN_SET);
             speed = -speed;
         }else{
             HAL_GPIO_WritePin(LF_IN1_PORT, LF_IN1_PIN, GPIO_PIN_RESET);
@@ -398,11 +398,11 @@ void motor_set_speed(motor_id_t id, int16_t speed)
         break;
     case MOTOR_LR:
         if(speed > 0){
-            HAL_GPIO_WritePin(LR_IN1_PORT, LR_IN1_PIN, GPIO_PIN_RESET);
-            HAL_GPIO_WritePin(LR_IN2_PORT, LR_IN2_PIN, GPIO_PIN_SET);
-        }else if(speed < 0){
             HAL_GPIO_WritePin(LR_IN1_PORT, LR_IN1_PIN, GPIO_PIN_SET);
             HAL_GPIO_WritePin(LR_IN2_PORT, LR_IN2_PIN, GPIO_PIN_RESET);
+        }else if(speed < 0){
+            HAL_GPIO_WritePin(LR_IN1_PORT, LR_IN1_PIN, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(LR_IN2_PORT, LR_IN2_PIN, GPIO_PIN_SET);
             speed = -speed;
         }else{
             HAL_GPIO_WritePin(LR_IN1_PORT, LR_IN1_PIN, GPIO_PIN_RESET);

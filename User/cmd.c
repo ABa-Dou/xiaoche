@@ -37,10 +37,14 @@ bool cmd_parse(const uint8_t *buf, uint16_t len, cmd_params_t *params)
 
     const char *p = (const char *)buf + 3;
 
-    if (*p >= '1' && *p <= '4' && (*(p + 1) == ' ' || *(p + 1) == '\t'))
+    if (*p >= '0' && *p <= '3' && (*(p + 1) == ' ' || *(p + 1) == '\t'))
     {
         params->motor_id = (uint8_t)(*p - '0');
         p++;
+    }
+    else
+    {
+        params->motor_id = 0xFF;
     }
 
     while (*p != '\0')

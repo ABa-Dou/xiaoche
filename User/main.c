@@ -14,7 +14,7 @@
 
 /* 默认值 (mm/s 域) */
 #define DEFAULT_KP              1.0f
-#define DEFAULT_KI              4.0f
+#define DEFAULT_KI              0.0f
 #define DEFAULT_KD              0.0f
 #define DEFAULT_FF_GAIN         1.1f
 #define DEFAULT_TGT_SPEED       150.0f
@@ -46,8 +46,8 @@ void apply_params(pid_t pid[], float *filter_alpha,
                          cmd_params_t *cmd, float tgt_speed_mm_s[])
 {
     int start = 0, end = MOTOR_COUNT;
-    if (cmd->motor_id > 0) {
-        start = (int)s_motor_map[cmd->motor_id];
+    if (cmd->motor_id != 0xFF) {
+        start = (int)cmd->motor_id;
         end = start + 1;
     }
 
@@ -62,7 +62,7 @@ void apply_params(pid_t pid[], float *filter_alpha,
     }
     if (cmd->has_flt)  *filter_alpha = cmd->filter_alpha;
 
-    if (cmd->motor_id == 0) {
+    if (cmd->motor_id == 0xFF) {
         LOGI("Params[ALL]: P=%.2f I=%.2f D=%.2f FF=%.2f tgt=%.1fmm/s ilim=%.0f sep=%.1f flt=%.2f",
              pid[0].kp, pid[0].ki, pid[0].kd, pid[0].ff_gain, tgt_speed_mm_s[0],
              pid[0].integral_limit, pid[0].integral_separation_err, *filter_alpha);
@@ -94,7 +94,7 @@ int main(void)
     HAL_Init();
     sys_stm32_clock_init(336, 8, 2, 7);
     delay_init(168);
-    usart_init(115200);
+    usart_init(921600);
     led_init();
     motor_init();
 
@@ -125,8 +125,8 @@ int main(void)
             if (cmd_parse(g_usart_rx_buf, rx_len, &cmd))
             {
                 int start = 0, end = MOTOR_COUNT;
-                if (cmd.motor_id > 0) {
-                    start = (int)s_motor_map[cmd.motor_id];
+                if (cmd.motor_id != 0xFF) {
+                    start = (int)cmd.motor_id;
                     end = start + 1;
                     LOGW("Cmd received for motor %d, stopping...", cmd.motor_id);
                 } else {
@@ -164,6 +164,9 @@ int main(void)
         {
             last_tick += PID_PERIOD_MS;
 
+            static int g_log_skip = 0;
+            g_log_skip = (g_log_skip + 1) % 2;
+
             //便利所有电机
             for (int i = 0; i < MOTOR_COUNT; i++) {
                 float setpoint = tgt_speed_mm_s[i];
@@ -192,9 +195,9 @@ int main(void)
                 //设置电机pwm值
                 //if(i != 1) pwm_value = 0;
                 motor_set_speed((motor_id_t)i, pwm_value);
-                if (i == 1)
-                LOGW("motor[%d] kp=%.1f,setpoint=%.1f, cur_speed=%.1f, pwm_value=%.0f,speed_pulse=%.1f",
-                     i, pid[i].kp,setpoint, speed_raw_mm_s, pwm_value, speed_pulse);
+                if(g_log_skip == 0)
+                LOGW("motor[%d] kp=%.1f, ki=%.1f, kd=%.1f, setpoint=%.1f, cur_speed=%.1f, cur_err=%.1f, pwm_value=%d",
+                     i, pid[i].kp, pid[i].ki, pid[i].kd, setpoint, speed_raw_mm_s, pid[i].error, pwm_value);
                 /* pwm_percent = (float)pwm_value / (float)MOTOR_SPEED_MAX * 100.0f; */
                /*  LOGI("[%d] raw=%.1f flt=%.1f err=%.1f | P=%.1f I=%.1f D=%.1f FF=%.1f | out=%.1f pwm=%.1f%%",
                      i,
