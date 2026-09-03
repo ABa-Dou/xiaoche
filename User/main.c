@@ -9,10 +9,10 @@
 
 #define WHEEL_DIAMETER_MM       65.0f
 #define WHEEL_CIRCUMFERENCE_MM  (WHEEL_DIAMETER_MM * 3.14159265f)
-#define PID_PERIOD_MS           5
+#define PID_PERIOD_MS           10
 #define PID_PERIOD_S            (PID_PERIOD_MS / 1000.0f)
 
-/* 默认值 (mm/s 域) */
+/* ???? (mm/s ??) */
 #define DEFAULT_KP              1.0f
 #define DEFAULT_KI              0.0f
 #define DEFAULT_KD              0.0f
@@ -21,8 +21,9 @@
 #define DEFAULT_INTEGRAL_LIMIT  50.0f
 #define DEFAULT_INTEGRAL_SEP    50.0f
 #define DEFAULT_FILTER_ALPHA    0.30f
+#define RAMP_RATE_MM_S2         1000.0f
 
-/* 用户电机编号(1=RF 2=LF 3=RR 4=LR) → motor_id_t */
+/* ?????????(1=RF 2=LF 3=RR 4=LR) ?? motor_id_t */
 static const motor_id_t s_motor_map[5] = {
     0,             /* [0] unused */
     MOTOR_RF,      /* [1] RF */
@@ -31,7 +32,7 @@ static const motor_id_t s_motor_map[5] = {
     MOTOR_LR       /* [4] LR */
 };
 
-//一个脉冲对应的距离mm
+//??????????????mm
 static float pulses_per_mm(void)
 {
     return (float)ENCODER_PULSES_PER_REV / WHEEL_CIRCUMFERENCE_MM;
@@ -42,7 +43,7 @@ static float pulses_per_period_to_speed(float pulses)
     return pulses / pulses_per_mm() / PID_PERIOD_S;
 }
 
-void apply_params(pid_t pid[], float *filter_alpha,
+void apply_params(pid_t pid[], float filter_alpha[],
                          cmd_params_t *cmd, float tgt_speed_mm_s[])
 {
     int start = 0, end = MOTOR_COUNT;
@@ -85,7 +86,8 @@ int main(void)
     float speed_raw_mm_s = 0.0f;
     float speed_filtered[MOTOR_COUNT] = {0.0f};
     float tgt_speed_mm_s[MOTOR_COUNT];
-    float filter_alpha = DEFAULT_FILTER_ALPHA;
+    float filter_alpha[MOTOR_COUNT] = {0.0f};
+    float ramp_setpoint[MOTOR_COUNT] = {0.0f};
     float pid_out = 0.0f;
     int16_t pwm_value = 0;
     float pwm_percent = 0.0f;
@@ -100,8 +102,25 @@ int main(void)
 
     for (int i = 0; i < MOTOR_COUNT; i++) {
         motor_reset_encoder((motor_id_t)i);
-        pid_init(&pid[i], DEFAULT_KP, DEFAULT_KI, DEFAULT_KD, DEFAULT_FF_GAIN,
+        if (i == 0){
+            pid_init(&pid[i], 5.0f, DEFAULT_KI, DEFAULT_KD, 1.20f,
                  DEFAULT_INTEGRAL_LIMIT, (float)MOTOR_SPEED_MAX, DEFAULT_INTEGRAL_SEP);
+             filter_alpha[i] = DEFAULT_FILTER_ALPHA;
+        } else if(i == 1){
+            pid_init(&pid[i], 5.0f, DEFAULT_KI, DEFAULT_KD, 1.40f,
+                 DEFAULT_INTEGRAL_LIMIT, (float)MOTOR_SPEED_MAX, DEFAULT_INTEGRAL_SEP);
+             filter_alpha[i] = DEFAULT_FILTER_ALPHA;
+        }else if(i == 2){
+            pid_init(&pid[i], 5.0f, DEFAULT_KI, DEFAULT_KD, 1.40f,
+                 DEFAULT_INTEGRAL_LIMIT, (float)MOTOR_SPEED_MAX, DEFAULT_INTEGRAL_SEP);
+             filter_alpha[i] = DEFAULT_FILTER_ALPHA;
+        }else if(i == 3){
+            pid_init(&pid[i], 5.0f, DEFAULT_KI, DEFAULT_KD, 1.60f,
+                 DEFAULT_INTEGRAL_LIMIT, (float)MOTOR_SPEED_MAX, DEFAULT_INTEGRAL_SEP);
+             filter_alpha[i] = DEFAULT_FILTER_ALPHA;
+        }else{
+            LOGW("Invalid motor ID: %d", i);
+        }
         tgt_speed_mm_s[i] = DEFAULT_TGT_SPEED;
     }
 
@@ -124,29 +143,23 @@ int main(void)
 
             if (cmd_parse(g_usart_rx_buf, rx_len, &cmd))
             {
-                int start = 0, end = MOTOR_COUNT;
-                if (cmd.motor_id != 0xFF) {
-                    start = (int)cmd.motor_id;
-                    end = start + 1;
-                    LOGW("Cmd received for motor %d, stopping...", cmd.motor_id);
-                } else {
-                    LOGW("Cmd received, stopping all motors...");
-                }
+                LOGW("Cmd received, stopping all motors...");
 
-                for (int i = start; i < end; i++) {
+                for (int i = 0; i < MOTOR_COUNT; i++) {
                     motor_set_speed((motor_id_t)i, 0);
                     speed_filtered[i] = 0.0f;
+                    ramp_setpoint[i] = 0.0f;
                 }
 
-                apply_params(pid, &filter_alpha, &cmd, tgt_speed_mm_s);
+                apply_params(pid, filter_alpha, &cmd, tgt_speed_mm_s);
 
-                for (int i = start; i < end; i++) {
+                for (int i = 0; i < MOTOR_COUNT; i++) {
                     pid_reset(&pid[i]);
                     motor_reset_encoder((motor_id_t)i);
                 }
-                delay_ms(3000);
+                delay_ms(5000);
 
-                for (int i = start; i < end; i++) {
+                for (int i = 0; i < MOTOR_COUNT; i++) {
                     last_enc[i] = motor_get_encoder((motor_id_t)i);
                 }
                 last_tick = HAL_GetTick();
@@ -167,38 +180,45 @@ int main(void)
             static int g_log_skip = 0;
             g_log_skip = (g_log_skip + 1) % 2;
 
-            //便利所有电机
             for (int i = 0; i < MOTOR_COUNT; i++) {
-                float setpoint = tgt_speed_mm_s[i];
+                float ramp_step = RAMP_RATE_MM_S2 * PID_PERIOD_S;
+                if (ramp_setpoint[i] < tgt_speed_mm_s[i]) {
+                    ramp_setpoint[i] += ramp_step;
+                    if (ramp_setpoint[i] > tgt_speed_mm_s[i])
+                        ramp_setpoint[i] = tgt_speed_mm_s[i];
+                } else if (ramp_setpoint[i] > tgt_speed_mm_s[i]) {
+                    ramp_setpoint[i] -= ramp_step;
+                    if (ramp_setpoint[i] < tgt_speed_mm_s[i])
+                        ramp_setpoint[i] = tgt_speed_mm_s[i];
+                }
+                float setpoint = ramp_setpoint[i];
 
-                //获取增量编码器值--编码器的累计值
                 cur_enc = motor_get_encoder((motor_id_t)i);
 
-                //计算速度脉冲
                 speed_pulse = (float)(cur_enc - last_enc[i]);
 
-                //更新上次电机编码器值
+
                 last_enc[i] = cur_enc;
 
-                //计算目标速度
+
                 speed_raw_mm_s = pulses_per_period_to_speed(speed_pulse);
 
-                //低通滤波目标速度
-                // speed_filtered[i] = filter_alpha * speed_raw_mm_s
-                //                   + (1.0f - filter_alpha) * speed_filtered[i];
 
-                //计算pid输出
-                pid_out = pid_calculate(&pid[i], setpoint, speed_raw_mm_s,
+                speed_filtered[i] = filter_alpha[i] * speed_raw_mm_s
+                                  + (1.0f - filter_alpha[i]) * speed_filtered[i];
+
+
+                pid_out = pid_calculate(&pid[i], setpoint, speed_filtered[i],
                                         PID_PERIOD_S);
                 pwm_value = (int16_t)pid_out;
                 
-                //设置电机pwm值
+
                 //if(i != 1) pwm_value = 0;
                 motor_set_speed((motor_id_t)i, pwm_value);
-                if(g_log_skip == 0)
-                LOGW("motor[%d] kp=%.1f, ki=%.1f, kd=%.1f, setpoint=%.1f, cur_speed=%.1f, cur_err=%.1f, pwm_value=%d",
-                     i, pid[i].kp, pid[i].ki, pid[i].kd, setpoint, speed_raw_mm_s, pid[i].error, pwm_value);
-                /* pwm_percent = (float)pwm_value / (float)MOTOR_SPEED_MAX * 100.0f; */
+/*                 if(g_log_skip == 0 && i == 3)
+                LOGW("motor[%d] kp=%.1f, ff=%.2f, set=%.1f, raw=%.1f, flt=%.1f, err=%.1f, pwm=%d",
+                     i, pid[i].kp, pid[i].ff_gain, setpoint, speed_raw_mm_s, speed_filtered[i], pid[i].error, pwm_value);
+ */                /* pwm_percent = (float)pwm_value / (float)MOTOR_SPEED_MAX * 100.0f; */
                /*  LOGI("[%d] raw=%.1f flt=%.1f err=%.1f | P=%.1f I=%.1f D=%.1f FF=%.1f | out=%.1f pwm=%.1f%%",
                      i,
                      speed_raw_mm_s,

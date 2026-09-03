@@ -1,17 +1,17 @@
 /**
  ****************************************************************************************************
  * @file        pid.c
- * @brief       PID 闭环控制器 (FF + PI + D, 带 dt)
+ * @brief       PID ????????? (FF + PI + D, ?? dt)
  *
- * 公式:
- *   output = Kp * e  +  Ki * ∫e dt  +  Kd * de/dt  +  FF_gain * setpoint
+ * ???:
+ *   output = Kp * e  +  Ki * ??e dt  +  Kd * de/dt  +  FF_gain * setpoint
  *
- * 抗积分饱和:
- *   输出钳位后, 若误差方向与饱和方向一致, 回退积分增量
- * 积分分离:
- *   误差大于阈值时关闭积分, 防止超调
- * 微分滤波:
- *   一阶低通滤波
+ * ?????????:
+ *   ????λ??, ?????????????????, ???????????
+ * ???????:
+ *   ????????????????, ???????
+ * ??????:
+ *   ????????
  ****************************************************************************************************
  */
 
@@ -55,19 +55,19 @@ float pid_calculate(pid_t *pid, float setpoint, float feedback, float dt)
     float integral_before;
 
     if (dt <= 0.0f) dt = 0.05f;
-    //目标速度
+
     pid->setpoint = setpoint;
 
-    //当前速度
+
     pid->feedback = feedback;
 
-    //速度差值
+
     pid->error = setpoint - feedback;
 
-    /* P 项 */
+  
     p_out = pid->kp * pid->error;
 
-    /* I 项 (积分分离 + 限幅) */
+    
     /* integral_before = pid->integral;
     if (pid->integral_separation_err <= 0.0f ||
         fabsf(pid->error) <= pid->integral_separation_err)
@@ -83,7 +83,7 @@ float pid_calculate(pid_t *pid, float setpoint, float feedback, float dt)
     }
     i_out = pid->ki * pid->integral; */
 
-    /* D 项 (微分滤波) */
+    /* D ?? (??????) */
     /* raw_derivative = (pid->error - pid->last_error) / dt;
     pid->derivative = PID_DERIVATIVE_FILTER_ALPHA * raw_derivative
                     + (1.0f - PID_DERIVATIVE_FILTER_ALPHA) * pid->derivative;
@@ -91,39 +91,21 @@ float pid_calculate(pid_t *pid, float setpoint, float feedback, float dt)
 
     /* pid->last_error = pid->error; */
 
-    /* FF 项 */
-    /* ff_out = pid->ff_gain * setpoint; */
 
-    /* 求和 */
-    /* pid->output = p_out + i_out + d_out + ff_out; */
+    ff_out = pid->ff_gain * setpoint;
 
-    /* 输出限幅 + 抗积分饱和 */
-/*     if (pid->output_limit > 0.0f)
+    pid->output = p_out + ff_out;
+
+    if (pid->output_limit > 0.0f)
     {
         if (pid->output > pid->output_limit)
-        {
             pid->output = pid->output_limit;
-            if (pid->error > 0.0f && pid->integral > integral_before)
-            {
-                pid->integral = integral_before;
-            }
-        }
         else if (pid->output < -pid->output_limit)
-        {
             pid->output = -pid->output_limit;
-            if (pid->error < 0.0f && pid->integral < integral_before)
-            {
-                pid->integral = integral_before;
-            }
-        }
-    } */
+    }
 
-    /* 保存各分量用于调试 */
     pid->p_out = p_out;
-    pid->output = p_out;
-    /* pid->i_out = i_out;
-    pid->d_out = d_out;
-    pid->ff_out = ff_out; */
+    pid->ff_out = ff_out;
 
     return pid->output;
 }
