@@ -53,6 +53,7 @@ set(SOURCES
     BSP/Led/led.c
     BSP/Motor/motor.c
     BSP/PID/pid.c
+    BSP/Uart/uart.c
     CMSIS/Device/ST/STM32F4xx/Source/gcc/startup_stm32f407xx.s
 )
 
@@ -182,6 +183,7 @@ target_include_directories(${TARGET} PRIVATE
     BSP/Led
     BSP/Motor
     BSP/PID
+    BSP/Uart
 )
 
 

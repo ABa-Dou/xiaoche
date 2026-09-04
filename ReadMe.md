@@ -33,3 +33,8 @@ M0
     Kff = 1.20
     Ki = 0
     Kd = 0
+
+#	UART	TX	RX	AF	×ÜÏß	Ê±ÖÓ
+1	USART2	PA2	PA3	AF7	APB1	42MHz                   ESP32 wroom
+2	USART3	PB10	PB11	AF7	APB1	42MHz                   IMU
+3	UART4	PC10	PC11	AF8	APB1	42MHz                   LIDAR

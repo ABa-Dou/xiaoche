@@ -6,6 +6,7 @@
 #include "motor.h"
 #include "pid.h"
 #include "cmd.h"
+#include "uart.h"
 
 #define WHEEL_DIAMETER_MM       65.0f
 #define WHEEL_CIRCUMFERENCE_MM  (WHEEL_DIAMETER_MM * 3.14159265f)
@@ -99,6 +100,9 @@ int main(void)
     usart_init(921600);
     led_init();
     motor_init();
+    uart2_init(921600);
+    uart3_init(921600);
+    uart4_init(921600);
 
     for (int i = 0; i < MOTOR_COUNT; i++) {
         motor_reset_encoder((motor_id_t)i);
