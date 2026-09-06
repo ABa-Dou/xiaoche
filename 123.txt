@@ -1,0 +1,276 @@
+#include "imu_node.h"
+#include "node_link.h"
+#include "logger.h"
+#include "shared_memory.h"
+#include "shared_data.h"
+#include "math.h"
+
+void ImuNode::init_imu_config( int argc, char* argv[]){
+    struct option options[] = {
+        {"help",            no_argument,       nullptr, 1},
+        {"baud_rate",       required_argument, nullptr, 2},
+        {"ring_buffer_size",required_argument, nullptr, 3},
+        {"serial_port",     required_argument, nullptr, 4},
+        {nullptr, 0, nullptr, 0}
+    };
+
+    int option_id = 0;
+    optind = 0;
+
+    // 短选项：h 无参，b/r 带参数
+    while ((option_id = getopt_long(argc, argv, "hb:r:", options, nullptr)) != -1)
+    {
+        switch (option_id)
+        {
+            case 1:
+                // 帮助逻辑
+                break;
+            case 2:
+                imu_baud_rate_ = atoi(optarg);
+                LOGI("IMU config init baud_rate: %d", imu_baud_rate_);
+                break;
+            case 3:
+                imu_ring_buffer_size_ = atoi(optarg);
+                LOGI("IMU config init ring_buffer_size: %d", imu_ring_buffer_size_);
+                break;
+            case 4:
+                imu_serial_port_name_ = optarg;
+                LOGI("IMU config init serial_port: %s", imu_serial_port_name_.c_str());
+                break;
+            case '?':
+                LOGE("Unknown option or missing argument");
+                break;
+            default:
+                LOGE("IMU config init unknown option: %d", option_id);
+                break;
+        }
+    }
+}
+
+void ImuNode::init_shared_data_imu(void){
+    // 1. 动态竞争开辟/链接物理页
+    imu_shm_ptr_ = std::make_unique<SharedMemory>(SHARED_IMU_SHM_NAME, sizeof(SharedImuBuffer));
+    
+    if (imu_shm_ptr_->init()) {  
+        imu_data_shm_ = imu_shm_ptr_->get_shared_data<SharedImuBuffer>();
+        
+        if (imu_data_shm_) {
+            // ? 【核心修复】：只有当自己赢得了创建权，才允许初始化物理页
+            if (imu_shm_ptr_->is_creator()) {
+                std::memset(imu_data_shm_, 0, sizeof(SharedImuBuffer));
+
+                // 2. 硬件级初始化配置跨进程互斥锁属性
+                pthread_mutexattr_t mutex_attr;
+                pthread_mutexattr_init(&mutex_attr);
+                pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED); // 赋予跨进程威力
+                pthread_mutex_init(&imu_data_shm_->mutex, &mutex_attr);
+                pthread_mutexattr_destroy(&mutex_attr);
+
+                // 3. 初始化跨进程条件变量
+                pthread_condattr_t cond_attr;
+                pthread_condattr_init(&cond_attr);
+                pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
+                pthread_cond_init(&imu_data_shm_->cond, &cond_attr);
+                pthread_condattr_destroy(&cond_attr);
+
+                LOGI("共享内存由 IMU 节点抢先开辟、跨进程锁洗涤构造成功！");
+            } else {
+                LOGI("IMU 节点作为连接者顺利切入现有的 IMU 共享内存页。");
+            }
+        }
+    } else {
+        LOGE("IMU 共享内存创建或夺权失败！");
+    }
+}
+
+void ImuNode::init_imu_serialport(void){
+    imu_serialport_ = std::make_unique<Serialport>(
+        imu_serial_port_name_, 
+        static_cast<int>(imu_baud_rate_)
+    );
+}
+
+
+
+int ImuNode::imu_serial_port_read_only_callback(void* arg) {
+
+    ImuNode* self = reinterpret_cast<ImuNode*>(arg);
+    if (!self || !self->imu_serialport_ || !self->imu_serialport_->is_open()) {
+        LOGE("IMU node serial port read only callback serialport is not open");
+        return -1;
+    }
+
+    uint8_t temp_buf[256];
+    bool has_new_bytes = false;
+
+    // 只要底层内核有原始字节，死循环榨干它，杜绝缓存积压
+    while (true) {
+        // 第一时间锁定这批字节在 Linux 系统内降落的绝对时间戳
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts); // 统一对齐到单调硬件时钟
+        uint64_t current_time_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+    
+        int ret = self->imu_serialport_->read_data(temp_buf, sizeof(temp_buf));
+        if (ret > 0) {
+            has_new_bytes = true;
+            for (int i = 0; i < ret; i++) {
+                TimedByte tb;
+                tb.data = static_cast<char>(temp_buf[i]);
+                tb.timestamp_ns = current_time_ns; // 带着初生的时间戳入队
+                
+                if (!self->imu_ring_buffer_.push_ring_buffer(tb)) {
+                    LOGW("Ring buffer 满溢！主动强刷清空。");
+                    self->imu_ring_buffer_.clear_ring_buffer();
+                    break;
+                }
+            }
+            if (ret < 256) break; // 内核驱动缓冲区被抽干了，跳出
+        } else {
+            break; 
+        }
+    }
+    if (has_new_bytes) {
+        self->imu_timer_parse_and_write_shm_callback(arg);
+
+
+    }
+
+    return 0;
+}
+
+int ImuNode::imu_timer_parse_and_write_shm_callback(void* arg) {
+    ImuNode* self = reinterpret_cast<ImuNode*>(arg);
+
+    if (!self || !self->imu_data_shm_) {
+        LOGE("IMU node timer parse and write shm callback context or data_shm is null");
+        return -1;
+    }
+
+    // 只要本地环形缓冲区里的字节数大于或等于基础头部（3字节），就持续滑动比对
+    while (!self->imu_ring_buffer_.is_empty_buffer() && self->imu_ring_buffer_.count_buffer() >= 3) {
+        TimedByte h1, h2;
+        // 用纯 peek，在完全确定数据齐备前，绝对不能破坏队列现场
+        self->imu_ring_buffer_.peek_ring_buffer(h1, 0);
+        self->imu_ring_buffer_.peek_ring_buffer(h2, 1);
+
+        // 滑动窗口精确对齐帧头 0x7E 0x23
+        if (static_cast<uint8_t>(h1.data) == 0x7E && static_cast<uint8_t>(h2.data) == 0x23) {
+            
+            TimedByte len_byte;
+            self->imu_ring_buffer_.peek_ring_buffer(len_byte, 2);
+            
+            // 长度值本身就是整帧的总字节数！
+            size_t actual_pkg_size = static_cast<size_t>(static_cast<uint8_t>(len_byte.data)); 
+
+            // 安全防线：规避因意外杂波导致的异常大包或超短包
+            if (actual_pkg_size > 40 || actual_pkg_size < 5) {
+                TimedByte dummy;
+                self->imu_ring_buffer_.pop_ring_buffer(dummy); // 错位杂包，向前蠕动 1 字节
+                continue;
+            }
+
+            // 检查当前队列积攒的字节数是否满足整帧长度！
+            if (self->imu_ring_buffer_.count_buffer() < actual_pkg_size) {
+                break; // 字节还没凑齐！安全跳出循环，保护现场，等下一次 epoll 攒够了再解
+            }
+
+            uint64_t frame_timestamp_ns = h1.timestamp_ns; // 获取第一个字节诞生时的绝对时间戳
+
+            // 完美的弹出并出队整帧
+            for (size_t i = 0; i < actual_pkg_size; i++) {
+                TimedByte byte_data;
+                self->imu_ring_buffer_.pop_ring_buffer(byte_data);
+                self->imu_rcv_pkg[i] = static_cast<uint8_t>(byte_data.data); 
+            }
+
+            // 校验和运算
+            uint8_t calculated_sum = 0;
+            for (size_t i = 0; i < actual_pkg_size - 1; i++) {
+                calculated_sum += self->imu_rcv_pkg[i];
+            }
+
+            if (calculated_sum != self->imu_rcv_pkg[actual_pkg_size - 1]) {
+                LOGE("IMU 帧校验和错误！期望: 0x%02X, 实际: 0x%02X. 丢弃该帧。", 
+                     self->imu_rcv_pkg[actual_pkg_size - 1], calculated_sum);
+                continue; 
+            }
+
+            uint8_t cmd_type = self->imu_rcv_pkg[3];
+            uint8_t* payload = &self->imu_rcv_pkg[4];
+            
+            // 数据解析分支
+            if (cmd_type == 0x04) {
+                CartoImuFrame new_frame;
+                new_frame.timestamp_ns = frame_timestamp_ns;
+
+                // 依 Excel 协议拼回 16 位有符号整型
+                int16_t raw_ax = static_cast<int16_t>((payload[1] << 8) | payload[0]); 
+                int16_t raw_ay = static_cast<int16_t>((payload[3] << 8) | payload[2]); 
+                int16_t raw_az = static_cast<int16_t>((payload[5] << 8) | payload[4]); 
+                int16_t raw_gx = static_cast<int16_t>((payload[7] << 8) | payload[6]);   
+                int16_t raw_gy = static_cast<int16_t>((payload[9] << 8) | payload[8]);   
+                int16_t raw_gz = static_cast<int16_t>((payload[11] << 8) | payload[10]); 
+
+                // 执行物理单位缩放换算
+                const double accel_ratio = (16.0 / 32767.0) * 9.80665;       // g -> m/s?
+                const double gyro_ratio  = (2000.0 / 32767.0) * (M_PI / 180.0); // deg/s -> rad/s
+
+                new_frame.linear_acc_x = static_cast<double>(raw_ax) * accel_ratio;
+                new_frame.linear_acc_y = static_cast<double>(raw_ay) * accel_ratio;
+                new_frame.linear_acc_z = static_cast<double>(raw_az) * accel_ratio;
+
+                new_frame.angular_vel_x = static_cast<double>(raw_gx) * gyro_ratio;
+                new_frame.angular_vel_y = static_cast<double>(raw_gy) * gyro_ratio;
+                new_frame.angular_vel_z = static_cast<double>(raw_gz) * gyro_ratio;
+
+                // ? 1. 强行锁定跨进程互斥锁
+                pthread_mutex_lock(&self->imu_data_shm_->mutex);
+
+                // 2. 溢出检查
+                if (self->imu_data_shm_->size >= SharedImuBuffer::CAPACITY) {
+                    self->imu_data_shm_->head = (self->imu_data_shm_->head + 1) % SharedImuBuffer::CAPACITY;
+                    self->imu_data_shm_->size--;
+                }
+                
+                // 3. 数据安全写入共享内存尾部
+                self->imu_data_shm_->data[self->imu_data_shm_->tail] = new_frame;
+                self->imu_data_shm_->tail = (self->imu_data_shm_->tail + 1) % SharedImuBuffer::CAPACITY;
+                self->imu_data_shm_->size++;
+
+                // ? 4. 写完立刻释放互斥锁
+                pthread_mutex_unlock(&self->imu_data_shm_->mutex);
+
+                // ? 5. 原子激活唤醒阻挂起的消费端进程
+                pthread_cond_signal(&self->imu_data_shm_->cond);
+                
+                // 6. 发送通知信号
+                msg_info_t* msg_info = self->imu_node_link_->msg_make_nodelink(sizeof(msg_info_t));
+                if (msg_info) {
+                    msg_info->type = TYPE_MSG_IMU_TO_SLAM;
+                    self->imu_node_link_->msg_send_nodelink(KEY_MSG_IMU_SLAM, *msg_info, sizeof(msg_info_t));
+                    // ? 注意：如果你的 msg_make_nodelink 内部没有智能指针托管，
+                    // 记得在这里检查是否需要自由释放空闲堆区（如 delete msg_info; 或 free(msg_info);）
+                }
+            } // ? 【核心修复】在正确的位置闭合 if (cmd_type == 0x04)
+        } // ? 【核心修复】在正确的位置闭合 if (包头对齐)
+        else {
+            // 没对齐帧头，滑动一字节继续寻找 0x7E 0x23
+            TimedByte dummy;
+            self->imu_ring_buffer_.pop_ring_buffer(dummy);
+        }
+    } // while 循环结束
+
+    return 0;
+}
+
+void ImuNode::imu_heartbeat(void){
+    msg_info_t* msg_info = imu_node_link_->msg_make_nodelink(sizeof(msg_info_t));
+    if (msg_info) {
+        msg_info->type = TYPE_HEARTBEAT_IMU_TO_MASTER;
+        msg_info->data.element_uint[0] = static_cast<uint64_t>(get_current_time_sec());
+        imu_node_link_->msg_send_nodelink(KEY_HEARTBEAT_IMU_MASTER, *msg_info, sizeof(msg_info_t));
+        // ? 注意：如果你的 msg_make_nodelink 内部没有智能指针托管，
+        // 记得在这里检查是否需要自由释放空闲堆区（如 delete msg_info; 或 free(msg_info);）
+    }
+    
+}

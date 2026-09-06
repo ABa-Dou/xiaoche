@@ -40,8 +40,6 @@ int _write(int fd, char *ptr, int len)
 
     for (i = 0; i < len; i++)
     {
-        if (g_usart_rx_sta & 0x8000) return len;
-
         while ((USART1->SR & 0X40) == 0);           /* 等待上一个字符发送完成 */
 
         USART1->DR = (uint8_t)ptr[i];               /* 将要发送的字符写入到DR寄存器 */

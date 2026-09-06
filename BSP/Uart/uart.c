@@ -3,6 +3,11 @@
 static UART_HandleTypeDef huart2;
 static UART_HandleTypeDef huart3;
 static UART_HandleTypeDef huart4;
+static DMA_HandleTypeDef  hdma_usart3_rx;
+
+uint8_t  g_uart3_rx_buf[UART3_RX_BUF_SIZE];
+volatile uint16_t g_uart3_rx_len = 0;
+volatile uint8_t  g_uart3_rx_flag = 0;
 
 void uart2_init(uint32_t baudrate)
 {
@@ -32,12 +37,33 @@ void uart2_init(uint32_t baudrate)
     HAL_UART_Init(&huart2);
 }
 
+static void uart3_dma_start(void)
+{
+    DMA_Stream_TypeDef *stream = DMA1_Stream1;
+
+    stream->CR &= ~DMA_SxCR_EN;
+    for (volatile int i = 0; i < 10; i++) {}
+
+    DMA1->LIFCR = DMA_LIFCR_CTCIF1 | DMA_LIFCR_CHTIF1 |
+                  DMA_LIFCR_CTEIF1 | DMA_LIFCR_CDMEIF1 |
+                  DMA_LIFCR_CFEIF1;
+
+    stream->PAR  = (uint32_t)&(USART3->DR);
+    stream->M0AR = (uint32_t)g_uart3_rx_buf;
+    stream->NDTR = UART3_RX_BUF_SIZE;
+
+    stream->CR |= DMA_SxCR_EN;
+
+    USART3->CR3 |= USART_CR3_DMAR;
+}
+
 void uart3_init(uint32_t baudrate)
 {
     GPIO_InitTypeDef gpio = {0};
 
     __HAL_RCC_USART3_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_DMA1_CLK_ENABLE();
 
     gpio.Pin = GPIO_PIN_10;
     gpio.Mode = GPIO_MODE_AF_PP;
@@ -50,6 +76,23 @@ void uart3_init(uint32_t baudrate)
     gpio.Alternate = GPIO_AF7_USART3;
     HAL_GPIO_Init(GPIOB, &gpio);
 
+    hdma_usart3_rx.Instance                 = DMA1_Stream1;
+    hdma_usart3_rx.Init.Channel             = DMA_CHANNEL_4;
+    hdma_usart3_rx.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+    hdma_usart3_rx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_usart3_rx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_usart3_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart3_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart3_rx.Init.Mode                = DMA_NORMAL;
+    hdma_usart3_rx.Init.Priority            = DMA_PRIORITY_HIGH;
+    hdma_usart3_rx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    hdma_usart3_rx.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
+    hdma_usart3_rx.Init.MemBurst            = DMA_MBURST_SINGLE;
+    hdma_usart3_rx.Init.PeriphBurst         = DMA_PBURST_SINGLE;
+    HAL_DMA_Init(&hdma_usart3_rx);
+
+    __HAL_LINKDMA(&huart3, hdmarx, hdma_usart3_rx);
+
     huart3.Instance = USART3;
     huart3.Init.BaudRate = baudrate;
     huart3.Init.WordLength = UART_WORDLENGTH_8B;
@@ -58,6 +101,18 @@ void uart3_init(uint32_t baudrate)
     huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart3.Init.Mode = UART_MODE_TX_RX;
     HAL_UART_Init(&huart3);
+
+    HAL_NVIC_SetPriority(USART3_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(USART3_IRQn);
+
+    __HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
+
+    uart3_dma_start();
+}
+
+UART_HandleTypeDef *uart3_get_handle(void)
+{
+    return &huart3;
 }
 
 void uart4_init(uint32_t baudrate)
@@ -116,4 +171,27 @@ void uart3_send_buf(uint8_t *buf, uint16_t len)
 void uart4_send_buf(uint8_t *buf, uint16_t len)
 {
     HAL_UART_Transmit(&huart4, buf, len, HAL_MAX_DELAY);
+}
+
+void USART3_IRQHandler(void)
+{
+    if (USART3->SR & UART_FLAG_IDLE)
+    {
+        USART3->SR;
+        USART3->DR;
+
+        uint32_t ndtr = DMA1_Stream1->NDTR;
+        uint16_t rx_len = UART3_RX_BUF_SIZE - ndtr;
+
+        DMA1_Stream1->CR &= ~DMA_SxCR_EN;
+        USART3->CR3 &= ~USART_CR3_DMAR;
+
+        if (rx_len > 0 && rx_len < UART3_RX_BUF_SIZE)
+        {
+            g_uart3_rx_len = rx_len;
+            g_uart3_rx_flag = 1;
+        }
+
+        uart3_dma_start();
+    }
 }

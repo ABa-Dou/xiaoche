@@ -7,6 +7,8 @@
 #include "pid.h"
 #include "cmd.h"
 #include "uart.h"
+#include "imu.h"
+#include <string.h>
 
 #define WHEEL_DIAMETER_MM       65.0f
 #define WHEEL_CIRCUMFERENCE_MM  (WHEEL_DIAMETER_MM * 3.14159265f)
@@ -79,6 +81,7 @@ void apply_params(pid_t pid[], float filter_alpha[],
 
 int main(void)
 {
+    
     pid_t pid[MOTOR_COUNT];
     cmd_params_t cmd;
     int32_t last_enc[MOTOR_COUNT] = {0};
@@ -101,9 +104,10 @@ int main(void)
     led_init();
     motor_init();
     uart2_init(921600);
-    uart3_init(921600);
-    uart4_init(921600);
-
+    uart3_init(115200);
+    uart4_init(230400);
+    imu_init();
+    LOGW("system init ok");
     for (int i = 0; i < MOTOR_COUNT; i++) {
         motor_reset_encoder((motor_id_t)i);
         if (i == 0){
@@ -128,18 +132,38 @@ int main(void)
         tgt_speed_mm_s[i] = DEFAULT_TGT_SPEED;
     }
 
-    LOGW("Init OK. Cmd: pid[1-4] kp=X ki=X kd=X ff=X tgt=X ilim=X sep=X flt=X");
-    LOGW("Default: P=%.2f I=%.2f D=%.2f FF=%.2f tgt=%.1fmm/s ilim=%.0f sep=%.1f flt=%.2f",
-         DEFAULT_KP, DEFAULT_KI, DEFAULT_KD, DEFAULT_FF_GAIN, DEFAULT_TGT_SPEED,
-         DEFAULT_INTEGRAL_LIMIT, DEFAULT_INTEGRAL_SEP, filter_alpha);
-
     for (int i = 0; i < MOTOR_COUNT; i++) {
         last_enc[i] = motor_get_encoder((motor_id_t)i);
     }
     last_tick = HAL_GetTick();
 
+    static uint32_t imu_log_tick = 0;
     while (1)
     {
+        if (g_uart3_rx_flag)
+        {
+            __disable_irq();
+            uint16_t local_len = g_uart3_rx_len;
+            uint8_t local_buf[UART3_RX_BUF_SIZE];
+            memcpy(local_buf, g_uart3_rx_buf, local_len);
+            g_uart3_rx_flag = 0;
+            __enable_irq();
+            imu_feed(local_buf, local_len);
+        }
+
+        {
+            const imu_data_t *imu = imu_get_data();
+            if (imu->data_ready) {
+                if (HAL_GetTick() - imu_log_tick >= 500) {
+                    imu_log_tick = HAL_GetTick();
+                    LOGW("IMU ax=%.3f ay=%.3f az=%.3f gx=%.3f gy=%.3f gz=%.3f",
+                         imu->accel_x, imu->accel_y, imu->accel_z,
+                         imu->gyro_x, imu->gyro_y, imu->gyro_z);
+                }
+                ((imu_data_t *)imu)->data_ready = 0;
+            }
+        }
+
         if (g_usart_rx_sta & 0x8000)
         {
             uint16_t rx_len = g_usart_rx_sta & 0x3FFF;

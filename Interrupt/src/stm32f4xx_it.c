@@ -58,7 +58,16 @@ void NMI_Handler(void)
   */
 void HardFault_Handler(void)
 {
-  /* Go to infinite loop when Hard Fault exception occurs */
+  while ((USART1->SR & 0x40) == 0);
+  USART1->DR = 'H';
+  while ((USART1->SR & 0x40) == 0);
+  USART1->DR = 'F';
+  while ((USART1->SR & 0x40) == 0);
+  USART1->DR = '!';
+  while ((USART1->SR & 0x40) == 0);
+  USART1->DR = '\r';
+  while ((USART1->SR & 0x40) == 0);
+  USART1->DR = '\n';
   while (1)
   {
   }
