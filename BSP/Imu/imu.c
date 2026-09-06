@@ -1,5 +1,7 @@
 #include "imu.h"
 #include "easy_log.h"
+#include "uart.h"
+#include "delay.h"
 #include <string.h>
 
 static uint8_t  s_ring_buf[IMU_RING_BUF_SIZE];
@@ -9,6 +11,7 @@ static uint16_t s_ring_count = 0;
 
 static imu_data_t s_imu_data;
 static uint8_t    s_pkg_buf[IMU_PKG_MAX_SIZE];
+static volatile uint8_t s_calib_result = 0xFF;
 
 static const float s_accel_ratio = (IMU_ACCEL_RANGE_G / IMU_RAW_FULL_SCALE) * IMU_GRAVITY_MPS2;
 static const float s_gyro_ratio  = (IMU_GYRO_RANGE_DPS / IMU_RAW_FULL_SCALE) * IMU_DEG_TO_RAD;
@@ -112,6 +115,9 @@ static void imu_parse_frames(void)
             s_imu_data.gyro_z  = (float)raw_gz * s_gyro_ratio;
             s_imu_data.data_ready = 1;
         }
+        else if (cmd == IMU_CMD_CALIB_RESP) {
+            s_calib_result = payload[1];
+        }
     }
 }
 
@@ -119,4 +125,61 @@ const imu_data_t *imu_get_data(void)
 {
     imu_parse_frames();
     return &s_imu_data;
+}
+
+void imu_calibrate(void)
+{
+    uint8_t cmd[7];
+    cmd[0] = IMU_FRAME_HEADER1;
+    cmd[1] = IMU_FRAME_HEADER2;
+    cmd[2] = 0x07;
+    cmd[3] = IMU_CMD_CALIBRATE;
+    cmd[4] = 0x01;
+    cmd[5] = 0x5F;
+    cmd[6] = cmd[0] + cmd[1] + cmd[2] + cmd[3] + cmd[4] + cmd[5];
+
+    s_calib_result = 0xFF;
+
+    LOGW("IMU calibrating...");
+    uart3_send_buf(cmd, 7);
+
+    uint8_t got_data_after_cal = 0;
+    uint32_t start = HAL_GetTick();
+    while (HAL_GetTick() - start < 15000)
+    {
+        if (g_uart3_rx_flag)
+        {
+            __disable_irq();
+            uint16_t local_len = g_uart3_rx_len;
+            uint8_t local_buf[UART3_RX_BUF_SIZE];
+            memcpy(local_buf, g_uart3_rx_buf, local_len);
+            g_uart3_rx_flag = 0;
+            __enable_irq();
+            imu_feed(local_buf, local_len);
+        }
+
+        imu_parse_frames();
+
+        if (s_calib_result != 0xFF)
+        {
+            if (s_calib_result == 0x01)
+                LOGW("IMU calibrate success");
+            else
+                LOGW("IMU calibrate failed (status=%d)", s_calib_result);
+            return;
+        }
+
+        if (s_imu_data.data_ready)
+        {
+            s_imu_data.data_ready = 0;
+            got_data_after_cal++;
+            if (got_data_after_cal >= 3)
+            {
+                LOGW("IMU calibrate done (data resumed)");
+                return;
+            }
+        }
+    }
+
+    LOGW("IMU calibrate timeout");
 }

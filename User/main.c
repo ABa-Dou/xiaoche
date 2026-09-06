@@ -8,6 +8,7 @@
 #include "cmd.h"
 #include "uart.h"
 #include "imu.h"
+#include "lidar.h"
 #include <string.h>
 
 #define WHEEL_DIAMETER_MM       65.0f
@@ -107,7 +108,13 @@ int main(void)
     uart3_init(115200);
     uart4_init(230400);
     imu_init();
+    lidar_init();
     LOGW("system init ok");
+    imu_calibrate();
+    lidar_stop_scan();
+    delay_ms(100);
+    lidar_start_scan();
+    LOGW("lidar scan started");
     for (int i = 0; i < MOTOR_COUNT; i++) {
         motor_reset_encoder((motor_id_t)i);
         if (i == 0){
@@ -137,7 +144,6 @@ int main(void)
     }
     last_tick = HAL_GetTick();
 
-    static uint32_t imu_log_tick = 0;
     while (1)
     {
         if (g_uart3_rx_flag)
@@ -151,16 +157,32 @@ int main(void)
             imu_feed(local_buf, local_len);
         }
 
+        if (g_uart4_rx_flag)
+        {
+            __disable_irq();
+            uint16_t local_len4 = g_uart4_rx_len;
+            uint8_t local_buf4[UART4_RX_BUF_SIZE];
+            memcpy(local_buf4, g_uart4_rx_buf, local_len4);
+            g_uart4_rx_flag = 0;
+            __enable_irq();
+            lidar_feed(local_buf4, local_len4);
+        }
+
         {
             const imu_data_t *imu = imu_get_data();
             if (imu->data_ready) {
-                if (HAL_GetTick() - imu_log_tick >= 500) {
-                    imu_log_tick = HAL_GetTick();
-                    LOGW("IMU ax=%.3f ay=%.3f az=%.3f gx=%.3f gy=%.3f gz=%.3f",
-                         imu->accel_x, imu->accel_y, imu->accel_z,
-                         imu->gyro_x, imu->gyro_y, imu->gyro_z);
-                }
+                LOGI("IMU ax=%.3f ay=%.3f az=%.3f gx=%.3f gy=%.3f gz=%.3f",
+                     imu->accel_x, imu->accel_y, imu->accel_z,
+                     imu->gyro_x, imu->gyro_y, imu->gyro_z);
                 ((imu_data_t *)imu)->data_ready = 0;
+            }
+        }
+
+        {
+            const lidar_frame_t *frame = lidar_get_frame();
+            if (frame->data_ready) {
+                LOGI("Lidar %u pts", frame->point_num);
+                ((lidar_frame_t *)frame)->data_ready = 0;
             }
         }
 

@@ -1,11 +1,301 @@
-#include "imu_node.h"
-#include "node_link.h"
-#include "logger.h"
-#include "shared_memory.h"
-#include "shared_data.h"
-#include "math.h"
+#include "lidar_node.h"
 
-void ImuNode::init_imu_config( int argc, char* argv[]){
+
+int LidarNode::lidar_rcv_msg_from_serial(){
+    //LOGI("lidar_rcv_msg_from_serial");
+    if (rcv_lidar_pkg.size() - write_pos_ < 4096) {
+        size_t unparsed_len = write_pos_ - read_pos_;
+        if (unparsed_len > 0 && read_pos_ > 0) {
+            std::memmove(rcv_lidar_pkg.data(), rcv_lidar_pkg.data() + read_pos_, unparsed_len);
+        }
+        read_pos_ = 0;
+        write_pos_ = unparsed_len;
+    }
+
+    while (true) {
+       // LOGI("lidar_rcv_msg_from_serial111");
+        // 直接让串口将数据读入到 vector 尾部的空闲区域，避免 local_buf 的二次拷贝！
+        uint8_t* write_ptr = rcv_lidar_pkg.data() + write_pos_;
+        size_t free_space = rcv_lidar_pkg.size() - write_pos_;
+        
+        ssize_t bytes_read = lidar_serial_port_->read_data(write_ptr, free_space);
+        
+        if (bytes_read > 0) {
+            write_pos_ += bytes_read; // 更新写指针
+        } 
+        else if (bytes_read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break; 
+            } else {
+                perror("Serial read error");
+                break;
+            }
+        } 
+        else { // bytes_read == 0
+            break;
+        }
+    }
+
+    parse_lidar_buffer();
+
+    return 0;
+}
+
+void LidarNode::parse_lidar_buffer() {
+    //LOGI("parse_lidar_buffer start");
+    
+    // 1. 既然要判断 read_pos_ 和 read_pos_ + 1，缓冲区至少要有 2 个字节
+    while ((write_pos_ - read_pos_) >= 2) {
+        
+        // 2. 寻找包头地标 0xAA 0x55
+        // 注意：根据手册图示，LSB是0xAA，MSB是0x55。在串口字节流中，0xAA 在前，0x55 在后
+        if (rcv_lidar_pkg[read_pos_] != 0xAA || rcv_lidar_pkg[read_pos_ + 1] != 0x55) {
+            read_pos_++; // 未对齐，读指针后移 1 字节继续找
+            continue;
+        }
+
+        // 3. 基础固定头部（PH到CS共10字节：PH(2)+CT(1)+LSN(1)+FSA(2)+LSA(2)+CS(2)）
+        // 没收全则跳出循环，留到下一次 epoll 触发接收
+        if ((write_pos_ - read_pos_) < 10) {
+            break; 
+        }
+
+        // 4. 【关键修复】现在安全地提取关键控制字段
+        uint8_t ct  = rcv_lidar_pkg[read_pos_ + 2];
+        uint8_t lsn = rcv_lidar_pkg[read_pos_ + 3];
+        
+        // 根据变长协议：一包从 0xAA 开始的后续总长度 = 10 字节固定头 + 2 * LSN 采样数据
+        size_t pkg_body_len = 10 + 2 * lsn;
+
+        // 5. 检查当前缓冲区的数据，是否够这一整包
+        if ((write_pos_ - read_pos_) < pkg_body_len) {
+            break; // 发生了半包，留到下一次收齐了再解析
+        }
+        // 零位包的 CT[bit 0] 往往代表特殊信号（Freq<<1 + 1），最低位通常为1
+      // 6. 提取成功，优先处理“零位包(起始包)”的切帧发布逻辑
+        bool is_zero_package = ((ct & 0x01) == 1); 
+
+        if (is_zero_package) {
+            uint8_t last_crc = (read_pos_ > 0) ? rcv_lidar_pkg[read_pos_ - 1] : 0;
+            (void)last_crc; 
+
+            if (local_frame_.point_num > 0) {
+                local_frame_.frame_id = frame_counter_++;
+                local_frame_.timestamp_ns = get_system_timestamp_ns(); 
+                
+                // ? 1. 零拷贝式直接打入无锁环形 slots 中
+                publish_to_shared_memory(local_frame_);
+                
+                // ? 2. 申请全车通信管道信号包，通知 slam_node 反应堆唤醒读取
+                msg_info_t* msg_info = lidar_node_link_->msg_make_nodelink(sizeof(msg_info_t));
+                if (msg_info) {
+                    msg_info->type = TYPE_MSG_RADAR_TO_SLAM; // 确保类型标识一致
+                    lidar_node_link_->msg_send_nodelink(KEY_MSG_RADAR_SLAM, *msg_info, sizeof(msg_info_t));
+                    
+                    // ? 【重要提醒】：如果你的通信框架设计中 msg_make_nodelink 返回的是原生堆指针，
+                    // 且 msg_send_nodelink 内部没有负责将其 free/delete，请务必在此处将其释放：
+                    // free(msg_info); 或 delete msg_info; 从而彻底封杀几百赫兹运行下的内存泄漏！
+                } else {
+                    LOGE("Failed to create message for SLAM notification");
+                }
+
+                // 清空计数器，为新的一圈腾出空间
+                local_frame_.point_num = 0;
+            }
+        } // <--- is_zero_package 闭合
+
+
+        // 7. 提取 FSA, LSA, CS 等进行数据解析
+        uint16_t fsa = (rcv_lidar_pkg[read_pos_ + 5] << 8) | rcv_lidar_pkg[read_pos_ + 4];
+        uint16_t lsa = (rcv_lidar_pkg[read_pos_ + 7] << 8) | rcv_lidar_pkg[read_pos_ + 6];
+        uint16_t cs  = (rcv_lidar_pkg[read_pos_ + 9] << 8) | rcv_lidar_pkg[read_pos_ + 8];
+        (void)cs; // 预留后续校验使用
+
+        // 解析出起始角和结束角（转换为度数，除以 64.0）
+        double angle_fsa = static_cast<double>(fsa >> 1) / 64.0; 
+        double angle_lsa = static_cast<double>(lsa >> 1) / 64.0;
+
+        // 处理角度跨越 360 度边界的情况（比如起始角 350度，结束角 10度）
+        if (angle_lsa < angle_fsa) {
+            angle_lsa += 360.0;
+        }
+
+        // 计算这一包点云的总角度跨度
+        double angle_diff = angle_lsa - angle_fsa;
+
+        // 8. 遍历解析这一包里的每一个采样点 Si 并压入局部点云帧
+        for (uint8_t i = 0; i < lsn; ++i) {
+            uint8_t si_low  = rcv_lidar_pkg[read_pos_ + 10 + 2 * i];
+            uint8_t si_high = rcv_lidar_pkg[read_pos_ + 11 + 2 * i];
+            uint16_t si_raw = (si_high << 8) | si_low;
+
+            // 距离按 YOLIDAR 标准比例除以 4
+            double distance = static_cast<double>(si_raw) / 4.0; 
+
+            // 角度内插公式计算当前点的精准角度
+            double angle = 0.0;
+            if (lsn > 1) {
+                angle = angle_fsa + (angle_diff / (lsn - 1)) * i;
+            } else {
+                angle = angle_fsa;
+            }
+
+            // 矫正回 0~360 度范围内
+            if (angle >= 360.0) {
+                angle -= 360.0;
+            }
+
+            // 过滤掉无效点，并安全压入固定容量数组中
+            if (distance > 0.1) {
+                if (local_frame_.point_num < 1200) {
+                    local_frame_.points[local_frame_.point_num].angle = (float)angle;
+                    local_frame_.points[local_frame_.point_num].distance = (float)distance;
+                    local_frame_.point_num++;
+                }
+            }
+        }
+
+        // 9. 【核心】成功消费完一包，读指针安全后移整包长度
+        read_pos_ += pkg_body_len;
+    }
+}
+
+void LidarNode::publish_to_shared_memory(const PointCloudFrame& frame) {
+    // 1. 安全性检查：确保共享内存指针已成功映射
+    if (!lidar_data_shm_ptr_) {
+        LOGE("Shared memory pointer is null! Cannot publish lidar frame.");
+        return;
+    }
+
+    // 2. 获取当前正在写入的槽位
+    uint32_t curr_write = lidar_data_shm_ptr_->write_index.load(std::memory_order_relaxed);
+    
+    // 3. 计算下一个准备写入的空闲槽位 (0 ~ 3 循环)
+    uint32_t next_write = (curr_write + 1) % SHARED_LIDAR_BUFFER_SIZE;
+
+    // 4. 防止踩踏：如果要写入的下一个槽位恰好是消费端当前正在读取的最新槽位
+    // 这种极端情况概率很低（除非消费端卡死），如果发生，需要避开，选择另一个非 head_index 槽位
+    uint32_t current_head = lidar_data_shm_ptr_->head_index.load(std::memory_order_acquire);
+    if (next_write == current_head) {
+        next_write = (next_write + 1) % SHARED_LIDAR_BUFFER_SIZE;
+    }
+
+    // 5. 高效拷贝：直接零拷贝式 memcpy 把本地攒满的一圈点云数据打入共享内存对应的格子中
+    std::memcpy(&(lidar_data_shm_ptr_->slots[next_write]), &frame, sizeof(PointCloudFrame));
+
+    // 6. 原子同步步进：更新写索引
+    lidar_data_shm_ptr_->write_index.store(next_write, std::memory_order_release);
+
+    // 7. 广播通知：将最新完成的有效槽位编号赋给 head_index，SLAM 进程通过监控此索引变化即可瞬间响应
+    lidar_data_shm_ptr_->head_index.store(next_write, std::memory_order_release);
+
+    // 8. 调试日志：确认数据切帧输出正常
+    LOGI("Lidar SHM Published -> Frame ID: %u, Points: %u, Slot: %u, TS: %lu us", 
+         frame.frame_id, frame.point_num, next_write, frame.timestamp_ns);
+}
+
+uint64_t LidarNode::get_system_timestamp_ns() {
+    auto now = std::chrono::system_clock::now();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+}
+
+
+
+
+
+int LidarNode::lidar_start_with_freq(double target_hz) {
+    LOGI("Preparing to initialize YOLIDAR to %.1f Hz...", target_hz);
+    int fd = lidar_serial_port_->get_fd();
+
+
+    // 1. 强行下发停止扫描命令，确保雷达处于静默配置模式
+    if (cmd_stop_scan() < 0) return -1;
+
+    // 1. 下发停止命令前，先清空一次
+
+    
+    usleep(50000);
+    // 清空本地接收缓存指针，防止老旧残余点云数据干扰
+    read_pos_ = 0;
+    write_pos_ = 0;
+
+    // 2. 闭环获取当前频率并调节
+    bool freq_settled = false;
+    int retry_count = 0;
+    
+    while (!freq_settled && retry_count < 20) {
+        retry_count++;
+        
+        // 发送 0x0D 获取当前频率
+        if (cmd_get_current_freq() < 0) continue;
+        tcflush(fd, TCIOFLUSH);
+        LidarCommandResponseHeader header;
+        uint8_t answer_data[4]; // 频率内容的 AnswerData 是 4 字节 (图14)
+        
+        // 读取 7 字节头
+        if (!read_serial_sync_with_timeout(lidar_serial_port_.get(), reinterpret_cast<uint8_t*>(&header), 7, 200)) {
+            LOGE("Timeout waiting for current frequency response header");
+            continue;
+        }
+        
+        // 读取 4 字节内容
+        if (!read_serial_sync_with_timeout(lidar_serial_port_.get(), answer_data, 4, 100)) {
+            LOGE("Timeout waiting for current frequency data content");
+            continue;
+        }
+        
+        // 解析当前频率：F = AnswerData / 100.0 (小端序拼装，见图14)
+        uint32_t raw_ans = (answer_data[3] << 24) | (answer_data[2] << 16) | (answer_data[1] << 8) | answer_data[0];
+        double current_hz = static_cast<double>(raw_ans) / 100.0;
+        LOGI("Lidar current frequency feedback: %.2f Hz", current_hz);
+        
+        // 判断当前频率是否满足要求 (引入 0.05 容错区间)
+        if (std::abs(current_hz - target_hz) < 0.05) {
+            LOGI("Lidar frequency successfully matched target: %.1f Hz", target_hz);
+            freq_settled = true;
+            break;
+        }
+        
+        // 如果当前频率不符合，进行增减步进微调
+        if (current_hz < target_hz) {
+            if (target_hz - current_hz >= 1.0) {
+                LOGI("Frequency too low, sending command: +1Hz");
+                cmd_increase_freq_1hz();
+            } else {
+                LOGI("Frequency close to target, sending command: +0.1Hz");
+                cmd_increase_freq_01hz();
+            }
+        } else {
+            if (current_hz - target_hz >= 1.0) {
+                LOGI("Frequency too high, sending command: -1Hz");
+                cmd_decrease_freq_1hz();
+            } else {
+                LOGI("Frequency close to target, sending command: -0.1Hz");
+                cmd_decrease_freq_01hz();
+            }
+        }
+        usleep(40000); // 步进调整后等待 40ms 让雷达内部存储生效
+    }
+
+    if (!freq_settled) {
+        LOGE("Failed to configuration lidar frequency to %.1f Hz within retries", target_hz);
+        return -1;
+    }
+
+    // 3. 频率校验成功，下发开始扫描命令跑起点云
+    LOGI("Frequency adjustment lock. Starting laser scan output...");
+    if (cmd_start_scan() < 0) {
+        LOGE("Failed to send start scan command!");
+        return -1;
+    }
+
+    // 此时雷达应答开始信号后，将源源不断吐出 0xAA 0x55 的密集点云包
+    // 退出此函数，后续把 fd 挂回你的 epoll 反应堆，进入普通的 `lidar_rcv_msg_from_serial` 即可！
+    return 0;
+}
+
+
+void LidarNode::lidar_init_config(int argc, char* argv[]){
     struct option options[] = {
         {"help",            no_argument,       nullptr, 1},
         {"baud_rate",       required_argument, nullptr, 2},
@@ -26,16 +316,14 @@ void ImuNode::init_imu_config( int argc, char* argv[]){
                 // 帮助逻辑
                 break;
             case 2:
-                imu_baud_rate_ = atoi(optarg);
-                LOGI("IMU config init baud_rate: %d", imu_baud_rate_);
+                lidar_baud_rate_ = atoi(optarg);
+                LOGI("Lidar config init baud_rate: %d", lidar_baud_rate_);
                 break;
             case 3:
-                imu_ring_buffer_size_ = atoi(optarg);
-                LOGI("IMU config init ring_buffer_size: %d", imu_ring_buffer_size_);
                 break;
             case 4:
-                imu_serial_port_name_ = optarg;
-                LOGI("IMU config init serial_port: %s", imu_serial_port_name_.c_str());
+                lidar_serial_port_name_ = optarg;
+                LOGI("Lidar config init serial_port: %s", lidar_serial_port_name_.c_str());
                 break;
             case '?':
                 LOGE("Unknown option or missing argument");
@@ -47,230 +335,109 @@ void ImuNode::init_imu_config( int argc, char* argv[]){
     }
 }
 
-void ImuNode::init_shared_data_imu(void){
-    // 1. 动态竞争开辟/链接物理页
-    imu_shm_ptr_ = std::make_unique<SharedMemory>(SHARED_IMU_SHM_NAME, sizeof(SharedImuBuffer));
+int LidarNode::lidar_init(){
+    if (!lidar_serial_port_) return -1;
+    LOGI("lidar_init start ......");
     
-    if (imu_shm_ptr_->init()) {  
-        imu_data_shm_ = imu_shm_ptr_->get_shared_data<SharedImuBuffer>();
+    return 0;
+}
+
+
+// 底层命令发送函数
+int LidarNode::send_command(uint8_t cmd_byte) {
+    if (!lidar_serial_port_) {
+        LOGE("Serial port not initialized");
+        return -1;
+    }
+    
+    uint8_t cmd[2] = {0xA5, cmd_byte};
+    int ret = lidar_serial_port_->write_data(cmd, 2);
+    if (ret < 0) {
+        LOGE("Failed to send command 0x%02X", cmd_byte);
+        return -1;
+    }
+    LOGI("Command 0xA5 0x%02X sent successfully", cmd_byte);
+    return 0;
+}
+
+void LidarNode::init_lidar_data_shm(void){
+    // 1. 动态竞争创建或链接雷达无锁共享内存页
+    lidar_shm_ptr_ = std::make_unique<SharedMemory>(SHARED_LIDAR_SHM_NAME, sizeof(SharedMemoryPoint));
+
+    if (lidar_shm_ptr_->init()) {  
+        lidar_data_shm_ptr_ = lidar_shm_ptr_->get_shared_data<SharedMemoryPoint>();
         
-        if (imu_data_shm_) {
-            // ? 【核心修复】：只有当自己赢得了创建权，才允许初始化物理页
-            if (imu_shm_ptr_->is_creator()) {
-                std::memset(imu_data_shm_, 0, sizeof(SharedImuBuffer));
-
-                // 2. 硬件级初始化配置跨进程互斥锁属性
-                pthread_mutexattr_t mutex_attr;
-                pthread_mutexattr_init(&mutex_attr);
-                pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED); // 赋予跨进程威力
-                pthread_mutex_init(&imu_data_shm_->mutex, &mutex_attr);
-                pthread_mutexattr_destroy(&mutex_attr);
-
-                // 3. 初始化跨进程条件变量
-                pthread_condattr_t cond_attr;
-                pthread_condattr_init(&cond_attr);
-                pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
-                pthread_cond_init(&imu_data_shm_->cond, &cond_attr);
-                pthread_condattr_destroy(&cond_attr);
-
-                LOGI("共享内存由 IMU 节点抢先开辟、跨进程锁洗涤构造成功！");
+        if (lidar_data_shm_ptr_) {
+            // ? 【核心修复】：只有当自己是第一个创建者，才去初始化 slots 状态机
+            // 如果是消费者（如 slam_node）先启动并代建了，当前雷达作为链接者，绝不 placement new 覆盖它！
+            if (lidar_shm_ptr_->is_creator()) {
+                new (lidar_data_shm_ptr_) SharedMemoryPoint();
+                LOGI("共享内存由 Lidar 节点抢先开辟、洗涤，无锁三阶环形多缓冲区构造成功！");
             } else {
-                LOGI("IMU 节点作为连接者顺利切入现有的 IMU 共享内存页。");
+                LOGI("Lidar 节点作为连接者顺利切入现有的 Lidar 共享内存页。");
             }
         }
     } else {
-        LOGE("IMU 共享内存创建或夺权失败！");
+        LOGE("雷达点云共享内存创建或夺权失败！");
     }
 }
-
-void ImuNode::init_imu_serialport(void){
-    imu_serialport_ = std::make_unique<Serialport>(
-        imu_serial_port_name_, 
-        static_cast<int>(imu_baud_rate_)
-    );
-}
-
-
-
-int ImuNode::imu_serial_port_read_only_callback(void* arg) {
-
-    ImuNode* self = reinterpret_cast<ImuNode*>(arg);
-    if (!self || !self->imu_serialport_ || !self->imu_serialport_->is_open()) {
-        LOGE("IMU node serial port read only callback serialport is not open");
-        return -1;
-    }
-
-    uint8_t temp_buf[256];
-    bool has_new_bytes = false;
-
-    // 只要底层内核有原始字节，死循环榨干它，杜绝缓存积压
-    while (true) {
-        // 第一时间锁定这批字节在 Linux 系统内降落的绝对时间戳
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts); // 统一对齐到单调硬件时钟
-        uint64_t current_time_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
-    
-        int ret = self->imu_serialport_->read_data(temp_buf, sizeof(temp_buf));
-        if (ret > 0) {
-            has_new_bytes = true;
-            for (int i = 0; i < ret; i++) {
-                TimedByte tb;
-                tb.data = static_cast<char>(temp_buf[i]);
-                tb.timestamp_ns = current_time_ns; // 带着初生的时间戳入队
-                
-                if (!self->imu_ring_buffer_.push_ring_buffer(tb)) {
-                    LOGW("Ring buffer 满溢！主动强刷清空。");
-                    self->imu_ring_buffer_.clear_ring_buffer();
-                    break;
-                }
-            }
-            if (ret < 256) break; // 内核驱动缓冲区被抽干了，跳出
-        } else {
-            break; 
-        }
-    }
-    if (has_new_bytes) {
-        self->imu_timer_parse_and_write_shm_callback(arg);
-
-
-    }
-
-    return 0;
-}
-
-int ImuNode::imu_timer_parse_and_write_shm_callback(void* arg) {
-    ImuNode* self = reinterpret_cast<ImuNode*>(arg);
-
-    if (!self || !self->imu_data_shm_) {
-        LOGE("IMU node timer parse and write shm callback context or data_shm is null");
-        return -1;
-    }
-
-    // 只要本地环形缓冲区里的字节数大于或等于基础头部（3字节），就持续滑动比对
-    while (!self->imu_ring_buffer_.is_empty_buffer() && self->imu_ring_buffer_.count_buffer() >= 3) {
-        TimedByte h1, h2;
-        // 用纯 peek，在完全确定数据齐备前，绝对不能破坏队列现场
-        self->imu_ring_buffer_.peek_ring_buffer(h1, 0);
-        self->imu_ring_buffer_.peek_ring_buffer(h2, 1);
-
-        // 滑动窗口精确对齐帧头 0x7E 0x23
-        if (static_cast<uint8_t>(h1.data) == 0x7E && static_cast<uint8_t>(h2.data) == 0x23) {
-            
-            TimedByte len_byte;
-            self->imu_ring_buffer_.peek_ring_buffer(len_byte, 2);
-            
-            // 长度值本身就是整帧的总字节数！
-            size_t actual_pkg_size = static_cast<size_t>(static_cast<uint8_t>(len_byte.data)); 
-
-            // 安全防线：规避因意外杂波导致的异常大包或超短包
-            if (actual_pkg_size > 40 || actual_pkg_size < 5) {
-                TimedByte dummy;
-                self->imu_ring_buffer_.pop_ring_buffer(dummy); // 错位杂包，向前蠕动 1 字节
-                continue;
-            }
-
-            // 检查当前队列积攒的字节数是否满足整帧长度！
-            if (self->imu_ring_buffer_.count_buffer() < actual_pkg_size) {
-                break; // 字节还没凑齐！安全跳出循环，保护现场，等下一次 epoll 攒够了再解
-            }
-
-            uint64_t frame_timestamp_ns = h1.timestamp_ns; // 获取第一个字节诞生时的绝对时间戳
-
-            // 完美的弹出并出队整帧
-            for (size_t i = 0; i < actual_pkg_size; i++) {
-                TimedByte byte_data;
-                self->imu_ring_buffer_.pop_ring_buffer(byte_data);
-                self->imu_rcv_pkg[i] = static_cast<uint8_t>(byte_data.data); 
-            }
-
-            // 校验和运算
-            uint8_t calculated_sum = 0;
-            for (size_t i = 0; i < actual_pkg_size - 1; i++) {
-                calculated_sum += self->imu_rcv_pkg[i];
-            }
-
-            if (calculated_sum != self->imu_rcv_pkg[actual_pkg_size - 1]) {
-                LOGE("IMU 帧校验和错误！期望: 0x%02X, 实际: 0x%02X. 丢弃该帧。", 
-                     self->imu_rcv_pkg[actual_pkg_size - 1], calculated_sum);
-                continue; 
-            }
-
-            uint8_t cmd_type = self->imu_rcv_pkg[3];
-            uint8_t* payload = &self->imu_rcv_pkg[4];
-            
-            // 数据解析分支
-            if (cmd_type == 0x04) {
-                CartoImuFrame new_frame;
-                new_frame.timestamp_ns = frame_timestamp_ns;
-
-                // 依 Excel 协议拼回 16 位有符号整型
-                int16_t raw_ax = static_cast<int16_t>((payload[1] << 8) | payload[0]); 
-                int16_t raw_ay = static_cast<int16_t>((payload[3] << 8) | payload[2]); 
-                int16_t raw_az = static_cast<int16_t>((payload[5] << 8) | payload[4]); 
-                int16_t raw_gx = static_cast<int16_t>((payload[7] << 8) | payload[6]);   
-                int16_t raw_gy = static_cast<int16_t>((payload[9] << 8) | payload[8]);   
-                int16_t raw_gz = static_cast<int16_t>((payload[11] << 8) | payload[10]); 
-
-                // 执行物理单位缩放换算
-                const double accel_ratio = (16.0 / 32767.0) * 9.80665;       // g -> m/s?
-                const double gyro_ratio  = (2000.0 / 32767.0) * (M_PI / 180.0); // deg/s -> rad/s
-
-                new_frame.linear_acc_x = static_cast<double>(raw_ax) * accel_ratio;
-                new_frame.linear_acc_y = static_cast<double>(raw_ay) * accel_ratio;
-                new_frame.linear_acc_z = static_cast<double>(raw_az) * accel_ratio;
-
-                new_frame.angular_vel_x = static_cast<double>(raw_gx) * gyro_ratio;
-                new_frame.angular_vel_y = static_cast<double>(raw_gy) * gyro_ratio;
-                new_frame.angular_vel_z = static_cast<double>(raw_gz) * gyro_ratio;
-
-                // ? 1. 强行锁定跨进程互斥锁
-                pthread_mutex_lock(&self->imu_data_shm_->mutex);
-
-                // 2. 溢出检查
-                if (self->imu_data_shm_->size >= SharedImuBuffer::CAPACITY) {
-                    self->imu_data_shm_->head = (self->imu_data_shm_->head + 1) % SharedImuBuffer::CAPACITY;
-                    self->imu_data_shm_->size--;
-                }
-                
-                // 3. 数据安全写入共享内存尾部
-                self->imu_data_shm_->data[self->imu_data_shm_->tail] = new_frame;
-                self->imu_data_shm_->tail = (self->imu_data_shm_->tail + 1) % SharedImuBuffer::CAPACITY;
-                self->imu_data_shm_->size++;
-
-                // ? 4. 写完立刻释放互斥锁
-                pthread_mutex_unlock(&self->imu_data_shm_->mutex);
-
-                // ? 5. 原子激活唤醒阻挂起的消费端进程
-                pthread_cond_signal(&self->imu_data_shm_->cond);
-                
-                // 6. 发送通知信号
-                msg_info_t* msg_info = self->imu_node_link_->msg_make_nodelink(sizeof(msg_info_t));
-                if (msg_info) {
-                    msg_info->type = TYPE_MSG_IMU_TO_SLAM;
-                    self->imu_node_link_->msg_send_nodelink(KEY_MSG_IMU_SLAM, *msg_info, sizeof(msg_info_t));
-                    // ? 注意：如果你的 msg_make_nodelink 内部没有智能指针托管，
-                    // 记得在这里检查是否需要自由释放空闲堆区（如 delete msg_info; 或 free(msg_info);）
-                }
-            } // ? 【核心修复】在正确的位置闭合 if (cmd_type == 0x04)
-        } // ? 【核心修复】在正确的位置闭合 if (包头对齐)
-        else {
-            // 没对齐帧头，滑动一字节继续寻找 0x7E 0x23
-            TimedByte dummy;
-            self->imu_ring_buffer_.pop_ring_buffer(dummy);
-        }
-    } // while 循环结束
-
-    return 0;
-}
-
-void ImuNode::imu_heartbeat(void){
-    msg_info_t* msg_info = imu_node_link_->msg_make_nodelink(sizeof(msg_info_t));
+void LidarNode::lidar_heartbeat(){
+    msg_info_t* msg_info = lidar_node_link_->msg_make_nodelink(sizeof(msg_info_t));
     if (msg_info) {
-        msg_info->type = TYPE_HEARTBEAT_IMU_TO_MASTER;
+        msg_info->type = TYPE_HEARTBEAT_LIDAR_TO_MASTER;
         msg_info->data.element_uint[0] = static_cast<uint64_t>(get_current_time_sec());
-        imu_node_link_->msg_send_nodelink(KEY_HEARTBEAT_IMU_MASTER, *msg_info, sizeof(msg_info_t));
+        lidar_node_link_->msg_send_nodelink(KEY_HEARTBEAT_LIDAR_MASTER, *msg_info, sizeof(msg_info_t));
         // ? 注意：如果你的 msg_make_nodelink 内部没有智能指针托管，
         // 记得在这里检查是否需要自由释放空闲堆区（如 delete msg_info; 或 free(msg_info);）
     }
-    
+}
+ 
+// 0x60: 开始扫描,输出点云数据
+int LidarNode::cmd_start_scan() {
+    return send_command(0x60);
+}
+ 
+// 0x65: 停机,停止扫描
+int LidarNode::cmd_stop_scan() {
+    return send_command(0x65);
+}
+ 
+// 0x90: 获取设备信息(型号、固件、硬件版本)
+int LidarNode::cmd_get_device_info() {
+    return send_command(0x90);
+}
+ 
+// 0x92: 获取设备健康状态
+int LidarNode::cmd_get_health_status() {
+    return send_command(0x92);
+}
+ 
+// 0x09: 增加0.1Hz当前设置的扫描频率
+int LidarNode::cmd_increase_freq_01hz() {
+    return send_command(0x09);
+}
+ 
+// 0x0A: 减小0.1Hz当前设置的扫描频率
+int LidarNode::cmd_decrease_freq_01hz() {
+    return send_command(0x0A);
+}
+ 
+// 0x0B: 增加1Hz当前设置的扫描频率
+int LidarNode::cmd_increase_freq_1hz() {
+    return send_command(0x0B);
+}
+ 
+// 0x0C: 减小1Hz当前设置的扫描频率
+int LidarNode::cmd_decrease_freq_1hz() {
+    return send_command(0x0C);
+}
+ 
+// 0x0D: 获取当前设置的扫描频率
+int LidarNode::cmd_get_current_freq() {
+    return send_command(0x0D);
+}
+ 
+// 0x40: 设备软重启
+int LidarNode::cmd_soft_reset() {
+    return send_command(0x40);
 }

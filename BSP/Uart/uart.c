@@ -4,10 +4,17 @@ static UART_HandleTypeDef huart2;
 static UART_HandleTypeDef huart3;
 static UART_HandleTypeDef huart4;
 static DMA_HandleTypeDef  hdma_usart3_rx;
+static DMA_HandleTypeDef  hdma_uart4_rx;
 
 uint8_t  g_uart3_rx_buf[UART3_RX_BUF_SIZE];
 volatile uint16_t g_uart3_rx_len = 0;
 volatile uint8_t  g_uart3_rx_flag = 0;
+
+uint8_t  g_uart4_rx_buf[UART4_RX_BUF_SIZE];
+volatile uint16_t g_uart4_rx_len = 0;
+volatile uint8_t  g_uart4_rx_flag = 0;
+volatile uint32_t g_uart4_irq_cnt = 0;
+volatile uint32_t g_uart4_rxne_cnt = 0;
 
 void uart2_init(uint32_t baudrate)
 {
@@ -42,7 +49,7 @@ static void uart3_dma_start(void)
     DMA_Stream_TypeDef *stream = DMA1_Stream1;
 
     stream->CR &= ~DMA_SxCR_EN;
-    for (volatile int i = 0; i < 10; i++) {}
+    while (stream->CR & DMA_SxCR_EN) {}
 
     DMA1->LIFCR = DMA_LIFCR_CTCIF1 | DMA_LIFCR_CHTIF1 |
                   DMA_LIFCR_CTEIF1 | DMA_LIFCR_CDMEIF1 |
@@ -51,6 +58,11 @@ static void uart3_dma_start(void)
     stream->PAR  = (uint32_t)&(USART3->DR);
     stream->M0AR = (uint32_t)g_uart3_rx_buf;
     stream->NDTR = UART3_RX_BUF_SIZE;
+    stream->FCR  = 0;
+
+    stream->CR = (4U << 25)  |
+                 (2U << 16)  |
+                 DMA_SxCR_MINC;
 
     stream->CR |= DMA_SxCR_EN;
 
@@ -115,12 +127,38 @@ UART_HandleTypeDef *uart3_get_handle(void)
     return &huart3;
 }
 
+static void uart4_dma_start(void)
+{
+    DMA_Stream_TypeDef *stream = DMA1_Stream2;
+
+    stream->CR &= ~DMA_SxCR_EN;
+    while (stream->CR & DMA_SxCR_EN) {}
+
+    DMA1->LIFCR = DMA_LIFCR_CTCIF2 | DMA_LIFCR_CHTIF2 |
+                  DMA_LIFCR_CTEIF2 | DMA_LIFCR_CDMEIF2 |
+                  DMA_LIFCR_CFEIF2;
+
+    stream->PAR  = (uint32_t)&(UART4->DR);
+    stream->M0AR = (uint32_t)g_uart4_rx_buf;
+    stream->NDTR = UART4_RX_BUF_SIZE;
+    stream->FCR  = 0;
+
+    stream->CR = (4U << 25)  |
+                 (2U << 16)  |
+                 DMA_SxCR_MINC;
+
+    stream->CR |= DMA_SxCR_EN;
+
+    UART4->CR3 |= USART_CR3_DMAR;
+}
+
 void uart4_init(uint32_t baudrate)
 {
     GPIO_InitTypeDef gpio = {0};
 
     __HAL_RCC_UART4_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_DMA1_CLK_ENABLE();
 
     gpio.Pin = GPIO_PIN_10;
     gpio.Mode = GPIO_MODE_AF_PP;
@@ -141,6 +179,19 @@ void uart4_init(uint32_t baudrate)
     huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart4.Init.Mode = UART_MODE_TX_RX;
     HAL_UART_Init(&huart4);
+
+    HAL_NVIC_SetPriority(UART4_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(UART4_IRQn);
+
+    __HAL_UART_ENABLE_IT(&huart4, UART_IT_IDLE);
+    __HAL_UART_ENABLE_IT(&huart4, UART_IT_ERR);
+
+    uart4_dma_start();
+}
+
+UART_HandleTypeDef *uart4_get_handle(void)
+{
+    return &huart4;
 }
 
 void uart2_send_byte(uint8_t data)
@@ -193,5 +244,40 @@ void USART3_IRQHandler(void)
         }
 
         uart3_dma_start();
+    }
+}
+
+void UART4_IRQHandler(void)
+{
+    uint32_t sr = UART4->SR;
+
+    if (sr & UART_FLAG_IDLE)
+    {
+        g_uart4_irq_cnt++;
+
+        DMA1_Stream2->CR &= ~DMA_SxCR_EN;
+        while (DMA1_Stream2->CR & DMA_SxCR_EN) {}
+        UART4->CR3 &= ~USART_CR3_DMAR;
+
+        UART4->DR;
+
+        uint32_t ndtr = DMA1_Stream2->NDTR;
+        uint16_t rx_len = UART4_RX_BUF_SIZE - ndtr;
+
+        if (rx_len > 0 && rx_len < UART4_RX_BUF_SIZE)
+        {
+            g_uart4_rx_len = rx_len;
+            g_uart4_rx_flag = 1;
+        }
+
+        uart4_dma_start();
+    }
+    else if (sr & (UART_FLAG_FE | UART_FLAG_ORE))
+    {
+        DMA1_Stream2->CR &= ~DMA_SxCR_EN;
+        while (DMA1_Stream2->CR & DMA_SxCR_EN) {}
+        UART4->CR3 &= ~USART_CR3_DMAR;
+        UART4->DR;
+        uart4_dma_start();
     }
 }

@@ -6,6 +6,8 @@
 #define IMU_FRAME_HEADER1   0x7E
 #define IMU_FRAME_HEADER2   0x23
 #define IMU_CMD_ACC_GYRO    0x04
+#define IMU_CMD_CALIBRATE   0x70
+#define IMU_CMD_CALIB_RESP  0x81
 
 #define IMU_RING_BUF_SIZE   512
 #define IMU_PKG_MAX_SIZE    40
@@ -29,5 +31,6 @@ typedef struct {
 void imu_init(void);
 void imu_feed(const uint8_t *buf, uint16_t len);
 const imu_data_t *imu_get_data(void);
+void imu_calibrate(void);
 
 #endif
