@@ -1,4 +1,6 @@
 #include "uart.h"
+#include "esp_proto.h"
+#include "easy_log.h"
 
 static UART_HandleTypeDef huart2;
 static UART_HandleTypeDef huart3;
@@ -61,6 +63,13 @@ void uart2_init(uint32_t baudrate)
     huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart2.Init.Mode = UART_MODE_TX_RX;
     HAL_UART_Init(&huart2);
+
+    __HAL_DMA_ENABLE_IT(&hdma_usart2_tx, DMA_IT_TC);
+    HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
+
+    HAL_NVIC_SetPriority(USART2_IRQn, 2, 1);
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
 }
 
 static void uart3_dma_start(void)
@@ -230,10 +239,10 @@ void uart4_send_byte(uint8_t data)
 
 void uart2_send_buf(uint8_t *buf, uint16_t len)
 {
-    if (huart2.gState != HAL_UART_STATE_READY) {
-        HAL_UART_AbortTransmit(&huart2);
+    HAL_StatusTypeDef ret = HAL_UART_Transmit_DMA(&huart2, buf, len);
+    if (ret != HAL_OK) {
+        LOGW("uart2 DMA ret=%d gState=%d", ret, huart2.gState);
     }
-    HAL_UART_Transmit_DMA(&huart2, buf, len);
 }
 
 void uart3_send_buf(uint8_t *buf, uint16_t len)
@@ -301,5 +310,22 @@ void UART4_IRQHandler(void)
         UART4->CR3 &= ~USART_CR3_DMAR;
         UART4->DR;
         uart4_dma_start();
+    }
+}
+
+void DMA1_Stream6_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&hdma_usart2_tx);
+}
+
+void USART2_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&huart2);
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        esp_proto_tx_complete();
     }
 }

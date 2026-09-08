@@ -16,7 +16,7 @@
 #define ESP_TYPE_IMU        3
 #define ESP_TYPE_LIDAR      4
 
-#define ESP_MAX_PAYLOAD     4098
+#define ESP_MAX_PAYLOAD     (2 + LIDAR_MAX_POINTS * 8)
 #define ESP_FRAME_OVERHEAD  13
 
 typedef struct {
@@ -37,6 +37,7 @@ typedef struct {
 } esp_imu_payload_t;
 
 void esp_proto_init(void);
+void esp_proto_tx_complete(void);
 void esp_proto_send_speed(uint32_t timestamp, const float speed_mm_s[MOTOR_COUNT]);
 void esp_proto_send_pulse(uint32_t timestamp, const int32_t total_pulse[MOTOR_COUNT]);
 void esp_proto_send_imu(uint32_t timestamp, const imu_data_t *imu);

@@ -8,7 +8,7 @@
 
 #define LIDAR_RING_BUF_SIZE     2048
 #define LIDAR_PKG_MAX_SIZE      256
-#define LIDAR_MAX_POINTS        512
+#define LIDAR_MAX_POINTS        720
 #define LIDAR_MAX_FRAMES        4
 
 typedef struct {
