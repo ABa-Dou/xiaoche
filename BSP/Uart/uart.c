@@ -3,6 +3,7 @@
 static UART_HandleTypeDef huart2;
 static UART_HandleTypeDef huart3;
 static UART_HandleTypeDef huart4;
+static DMA_HandleTypeDef  hdma_usart2_tx;
 static DMA_HandleTypeDef  hdma_usart3_rx;
 static DMA_HandleTypeDef  hdma_uart4_rx;
 
@@ -22,6 +23,7 @@ void uart2_init(uint32_t baudrate)
 
     __HAL_RCC_USART2_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_DMA1_CLK_ENABLE();
 
     gpio.Pin = GPIO_PIN_2;
     gpio.Mode = GPIO_MODE_AF_PP;
@@ -33,6 +35,23 @@ void uart2_init(uint32_t baudrate)
     gpio.Pin = GPIO_PIN_3;
     gpio.Alternate = GPIO_AF7_USART2;
     HAL_GPIO_Init(GPIOA, &gpio);
+
+    hdma_usart2_tx.Instance                 = DMA1_Stream6;
+    hdma_usart2_tx.Init.Channel             = DMA_CHANNEL_4;
+    hdma_usart2_tx.Init.Direction           = DMA_MEMORY_TO_PERIPH;
+    hdma_usart2_tx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_usart2_tx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_usart2_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart2_tx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart2_tx.Init.Mode                = DMA_NORMAL;
+    hdma_usart2_tx.Init.Priority            = DMA_PRIORITY_MEDIUM;
+    hdma_usart2_tx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    hdma_usart2_tx.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
+    hdma_usart2_tx.Init.MemBurst            = DMA_MBURST_SINGLE;
+    hdma_usart2_tx.Init.PeriphBurst         = DMA_PBURST_SINGLE;
+    HAL_DMA_Init(&hdma_usart2_tx);
+
+    __HAL_LINKDMA(&huart2, hdmatx, hdma_usart2_tx);
 
     huart2.Instance = USART2;
     huart2.Init.BaudRate = baudrate;
@@ -211,7 +230,10 @@ void uart4_send_byte(uint8_t data)
 
 void uart2_send_buf(uint8_t *buf, uint16_t len)
 {
-    HAL_UART_Transmit(&huart2, buf, len, HAL_MAX_DELAY);
+    if (huart2.gState != HAL_UART_STATE_READY) {
+        HAL_UART_AbortTransmit(&huart2);
+    }
+    HAL_UART_Transmit_DMA(&huart2, buf, len);
 }
 
 void uart3_send_buf(uint8_t *buf, uint16_t len)

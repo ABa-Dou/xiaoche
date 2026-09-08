@@ -56,6 +56,7 @@ set(SOURCES
     BSP/Uart/uart.c
     BSP/Imu/imu.c
     BSP/Lidar/lidar.c
+    BSP/EspProto/esp_proto.c
     CMSIS/Device/ST/STM32F4xx/Source/gcc/startup_stm32f407xx.s
 )
 
@@ -188,6 +189,7 @@ target_include_directories(${TARGET} PRIVATE
     BSP/Uart
     BSP/Imu
     BSP/Lidar
+    BSP/EspProto
 )
 
 

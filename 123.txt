@@ -1,443 +1,248 @@
-#include "lidar_node.h"
+================================================================================
+          STM32 -> ESP32 (UART2) 通信协议 —— 解帧指南
+================================================================================
+
+一、帧总体格式
+────────────────────────────────────────────────────────────
+  AA 55 | Length_L Length_H | Type | Seq | Timestamp | Payload | CRC_L CRC_H | 0D 0A
+  2字节   2字节              1字节  1字节   4字节      N字节     2字节         2字节
+────────────────────────────────────────────────────────────
+
+  字段      大小    说明
+  ─────     ────    ──────────────────────────────────────
+  帧头      2B      固定 0xAA 0x55，用于找帧起始
+  Length    2B      小端序，= 1(Type) + 1(Seq) + 4(Timestamp) + N(Payload) + 2(CRC)
+  Type      1B      数据类型: 1=瞬时速度, 2=总脉冲, 3=IMU, 4=雷达
+  Seq       1B      序号，每种Type独立从0递增(溢出回绕)
+  Timestamp 4B      时间戳，uint32_t，小端序，数据就绪瞬间打上的HAL_GetTick()毫秒数
+  Payload   NB      载荷数据，按Type不同结构不同(见下文)
+  CRC16     2B      Modbus CRC16，小端序(低字节在前)
+  帧尾      2B      固定 0x0D 0x0A，用于确认帧结束
+
+  Timestamp 说明:
+    - 在数据就绪的瞬间由调用方调用 HAL_GetTick() 获取，而非组帧发送时
+    - IMU/LiDAR: data_ready 为真的瞬间打戳
+    - 速度/脉冲: PID周期读取编码器数据的瞬间打戳
+    - 开机后经过的毫秒数，约49.7天溢出回绕一次
+    - 用于上层建图时对齐不同传感器数据的时间基准
+
+  Length 为2字节小端序，支持最大65535字节帧体，
+  可完整传输雷达全量数据(512点 = 4098字节Payload)。
+
+  CRC16 计算范围: 从 Length 字段开始，到 Payload 末尾结束
+                 (帧头 AA 55 和帧尾 0D 0A 不参与CRC计算)
+
+  CRC16 算法: Modbus标准
+    初始值 = 0xFFFF
+    对每个字节:
+      crc ^= byte
+      循环8次:
+        if (crc & 1)  crc = (crc >> 1) ^ 0xA001
+        else          crc >>= 1
 
 
-int LidarNode::lidar_rcv_msg_from_serial(){
-    //LOGI("lidar_rcv_msg_from_serial");
-    if (rcv_lidar_pkg.size() - write_pos_ < 4096) {
-        size_t unparsed_len = write_pos_ - read_pos_;
-        if (unparsed_len > 0 && read_pos_ > 0) {
-            std::memmove(rcv_lidar_pkg.data(), rcv_lidar_pkg.data() + read_pos_, unparsed_len);
-        }
-        read_pos_ = 0;
-        write_pos_ = unparsed_len;
-    }
+二、解帧步骤
+────────────────────────────────────────────────────────────
 
-    while (true) {
-       // LOGI("lidar_rcv_msg_from_serial111");
-        // 直接让串口将数据读入到 vector 尾部的空闲区域，避免 local_buf 的二次拷贝！
-        uint8_t* write_ptr = rcv_lidar_pkg.data() + write_pos_;
-        size_t free_space = rcv_lidar_pkg.size() - write_pos_;
-        
-        ssize_t bytes_read = lidar_serial_port_->read_data(write_ptr, free_space);
-        
-        if (bytes_read > 0) {
-            write_pos_ += bytes_read; // 更新写指针
-        } 
-        else if (bytes_read == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break; 
-            } else {
-                perror("Serial read error");
-                break;
-            }
-        } 
-        else { // bytes_read == 0
-            break;
-        }
-    }
+  1. 找帧头: 在字节流中搜索 0xAA 0x55
+  2. 读Length: 下两个字节，小端序 uint16_t
+  3. 计算Payload长度: payload_len = Length - 8  (减去Type+Seq+Timestamp+CRC16)
+  4. 读取Type(1B)、Seq(1B)、Timestamp(4B，小端uint32_t)、Payload(payload_len B)
+  5. 读取CRC16(2B，小端序): crc_recv = CRC_L | (CRC_H << 8)
+  6. 校验CRC: 对 Length+Type+Seq+Timestamp+Payload 计算CRC16，与crc_recv比对
+  7. 校验帧尾: 下两个字节应为 0x0D 0x0A
+  8. 根据Type解析Payload(见下文)
 
-    parse_lidar_buffer();
-
-    return 0;
-}
-
-void LidarNode::parse_lidar_buffer() {
-    //LOGI("parse_lidar_buffer start");
-    
-    // 1. 既然要判断 read_pos_ 和 read_pos_ + 1，缓冲区至少要有 2 个字节
-    while ((write_pos_ - read_pos_) >= 2) {
-        
-        // 2. 寻找包头地标 0xAA 0x55
-        // 注意：根据手册图示，LSB是0xAA，MSB是0x55。在串口字节流中，0xAA 在前，0x55 在后
-        if (rcv_lidar_pkg[read_pos_] != 0xAA || rcv_lidar_pkg[read_pos_ + 1] != 0x55) {
-            read_pos_++; // 未对齐，读指针后移 1 字节继续找
-            continue;
-        }
-
-        // 3. 基础固定头部（PH到CS共10字节：PH(2)+CT(1)+LSN(1)+FSA(2)+LSA(2)+CS(2)）
-        // 没收全则跳出循环，留到下一次 epoll 触发接收
-        if ((write_pos_ - read_pos_) < 10) {
-            break; 
-        }
-
-        // 4. 【关键修复】现在安全地提取关键控制字段
-        uint8_t ct  = rcv_lidar_pkg[read_pos_ + 2];
-        uint8_t lsn = rcv_lidar_pkg[read_pos_ + 3];
-        
-        // 根据变长协议：一包从 0xAA 开始的后续总长度 = 10 字节固定头 + 2 * LSN 采样数据
-        size_t pkg_body_len = 10 + 2 * lsn;
-
-        // 5. 检查当前缓冲区的数据，是否够这一整包
-        if ((write_pos_ - read_pos_) < pkg_body_len) {
-            break; // 发生了半包，留到下一次收齐了再解析
-        }
-        // 零位包的 CT[bit 0] 往往代表特殊信号（Freq<<1 + 1），最低位通常为1
-      // 6. 提取成功，优先处理“零位包(起始包)”的切帧发布逻辑
-        bool is_zero_package = ((ct & 0x01) == 1); 
-
-        if (is_zero_package) {
-            uint8_t last_crc = (read_pos_ > 0) ? rcv_lidar_pkg[read_pos_ - 1] : 0;
-            (void)last_crc; 
-
-            if (local_frame_.point_num > 0) {
-                local_frame_.frame_id = frame_counter_++;
-                local_frame_.timestamp_ns = get_system_timestamp_ns(); 
-                
-                // ? 1. 零拷贝式直接打入无锁环形 slots 中
-                publish_to_shared_memory(local_frame_);
-                
-                // ? 2. 申请全车通信管道信号包，通知 slam_node 反应堆唤醒读取
-                msg_info_t* msg_info = lidar_node_link_->msg_make_nodelink(sizeof(msg_info_t));
-                if (msg_info) {
-                    msg_info->type = TYPE_MSG_RADAR_TO_SLAM; // 确保类型标识一致
-                    lidar_node_link_->msg_send_nodelink(KEY_MSG_RADAR_SLAM, *msg_info, sizeof(msg_info_t));
-                    
-                    // ? 【重要提醒】：如果你的通信框架设计中 msg_make_nodelink 返回的是原生堆指针，
-                    // 且 msg_send_nodelink 内部没有负责将其 free/delete，请务必在此处将其释放：
-                    // free(msg_info); 或 delete msg_info; 从而彻底封杀几百赫兹运行下的内存泄漏！
-                } else {
-                    LOGE("Failed to create message for SLAM notification");
-                }
-
-                // 清空计数器，为新的一圈腾出空间
-                local_frame_.point_num = 0;
-            }
-        } // <--- is_zero_package 闭合
+  注意: 如果CRC校验失败或帧尾不匹配，丢弃该帧，重新搜索帧头。
 
 
-        // 7. 提取 FSA, LSA, CS 等进行数据解析
-        uint16_t fsa = (rcv_lidar_pkg[read_pos_ + 5] << 8) | rcv_lidar_pkg[read_pos_ + 4];
-        uint16_t lsa = (rcv_lidar_pkg[read_pos_ + 7] << 8) | rcv_lidar_pkg[read_pos_ + 6];
-        uint16_t cs  = (rcv_lidar_pkg[read_pos_ + 9] << 8) | rcv_lidar_pkg[read_pos_ + 8];
-        (void)cs; // 预留后续校验使用
+三、各类型Payload结构 (STM32端为小端序，float为IEEE 754单精度)
+────────────────────────────────────────────────────────────
 
-        // 解析出起始角和结束角（转换为度数，除以 64.0）
-        double angle_fsa = static_cast<double>(fsa >> 1) / 64.0; 
-        double angle_lsa = static_cast<double>(lsa >> 1) / 64.0;
+  ┌─────────────────────────────────────────────────────────┐
+  │ Type = 1  瞬时速度 (每20ms发送一次)                      │
+  │ Payload大小 = 16 字节                                    │
+  │                                                          │
+  │ 偏移  大小    类型      说明                              │
+  │ 0     4B     float     LF电机速度 (mm/s)                 │
+  │ 4     4B     float     RF电机速度 (mm/s)                 │
+  │ 8     4B     float     LR电机速度 (mm/s)                 │
+  │ 12    4B     float     RR电机速度 (mm/s)                 │
+  │                                                          │
+  │ Timestamp含义: PID周期读取编码器数据的时刻                │
+  └─────────────────────────────────────────────────────────┘
 
-        // 处理角度跨越 360 度边界的情况（比如起始角 350度，结束角 10度）
-        if (angle_lsa < angle_fsa) {
-            angle_lsa += 360.0;
-        }
-
-        // 计算这一包点云的总角度跨度
-        double angle_diff = angle_lsa - angle_fsa;
-
-        // 8. 遍历解析这一包里的每一个采样点 Si 并压入局部点云帧
-        for (uint8_t i = 0; i < lsn; ++i) {
-            uint8_t si_low  = rcv_lidar_pkg[read_pos_ + 10 + 2 * i];
-            uint8_t si_high = rcv_lidar_pkg[read_pos_ + 11 + 2 * i];
-            uint16_t si_raw = (si_high << 8) | si_low;
-
-            // 距离按 YOLIDAR 标准比例除以 4
-            double distance = static_cast<double>(si_raw) / 4.0; 
-
-            // 角度内插公式计算当前点的精准角度
-            double angle = 0.0;
-            if (lsn > 1) {
-                angle = angle_fsa + (angle_diff / (lsn - 1)) * i;
-            } else {
-                angle = angle_fsa;
-            }
-
-            // 矫正回 0~360 度范围内
-            if (angle >= 360.0) {
-                angle -= 360.0;
-            }
-
-            // 过滤掉无效点，并安全压入固定容量数组中
-            if (distance > 0.1) {
-                if (local_frame_.point_num < 1200) {
-                    local_frame_.points[local_frame_.point_num].angle = (float)angle;
-                    local_frame_.points[local_frame_.point_num].distance = (float)distance;
-                    local_frame_.point_num++;
-                }
-            }
-        }
-
-        // 9. 【核心】成功消费完一包，读指针安全后移整包长度
-        read_pos_ += pkg_body_len;
-    }
-}
-
-void LidarNode::publish_to_shared_memory(const PointCloudFrame& frame) {
-    // 1. 安全性检查：确保共享内存指针已成功映射
-    if (!lidar_data_shm_ptr_) {
-        LOGE("Shared memory pointer is null! Cannot publish lidar frame.");
-        return;
-    }
-
-    // 2. 获取当前正在写入的槽位
-    uint32_t curr_write = lidar_data_shm_ptr_->write_index.load(std::memory_order_relaxed);
-    
-    // 3. 计算下一个准备写入的空闲槽位 (0 ~ 3 循环)
-    uint32_t next_write = (curr_write + 1) % SHARED_LIDAR_BUFFER_SIZE;
-
-    // 4. 防止踩踏：如果要写入的下一个槽位恰好是消费端当前正在读取的最新槽位
-    // 这种极端情况概率很低（除非消费端卡死），如果发生，需要避开，选择另一个非 head_index 槽位
-    uint32_t current_head = lidar_data_shm_ptr_->head_index.load(std::memory_order_acquire);
-    if (next_write == current_head) {
-        next_write = (next_write + 1) % SHARED_LIDAR_BUFFER_SIZE;
-    }
-
-    // 5. 高效拷贝：直接零拷贝式 memcpy 把本地攒满的一圈点云数据打入共享内存对应的格子中
-    std::memcpy(&(lidar_data_shm_ptr_->slots[next_write]), &frame, sizeof(PointCloudFrame));
-
-    // 6. 原子同步步进：更新写索引
-    lidar_data_shm_ptr_->write_index.store(next_write, std::memory_order_release);
-
-    // 7. 广播通知：将最新完成的有效槽位编号赋给 head_index，SLAM 进程通过监控此索引变化即可瞬间响应
-    lidar_data_shm_ptr_->head_index.store(next_write, std::memory_order_release);
-
-    // 8. 调试日志：确认数据切帧输出正常
-    LOGI("Lidar SHM Published -> Frame ID: %u, Points: %u, Slot: %u, TS: %lu us", 
-         frame.frame_id, frame.point_num, next_write, frame.timestamp_ns);
-}
-
-uint64_t LidarNode::get_system_timestamp_ns() {
-    auto now = std::chrono::system_clock::now();
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-}
+  解析示例 (Python):
+    speed_lf = struct.unpack_from('<f', payload, 0)[0]
+    speed_rf = struct.unpack_from('<f', payload, 4)[0]
+    speed_lr = struct.unpack_from('<f', payload, 8)[0]
+    speed_rr = struct.unpack_from('<f', payload, 12)[0]
 
 
+  ┌─────────────────────────────────────────────────────────┐
+  │ Type = 2  总脉冲数 (每20ms发送一次)                      │
+  │ Payload大小 = 16 字节                                    │
+  │                                                          │
+  │ 偏移  大小    类型      说明                              │
+  │ 0     4B     int32_t   LF电机累计脉冲                    │
+  │ 4     4B     int32_t   RF电机累计脉冲                    │
+  │ 8     4B     int32_t   LR电机累计脉冲                    │
+  │ 12    4B     int32_t   RR电机累计脉冲                    │
+  │                                                          │
+  │ 编码器分辨率: 11线 × 4倍频 × 40减速比 = 1760 脉冲/转    │
+  │ Timestamp含义: 与Type=1相同，同一PID周期采集              │
+  └─────────────────────────────────────────────────────────┘
+
+  解析示例 (Python):
+    pulse_lf = struct.unpack_from('<i', payload, 0)[0]
+    pulse_rf = struct.unpack_from('<i', payload, 4)[0]
+    pulse_lr = struct.unpack_from('<i', payload, 8)[0]
+    pulse_rr = struct.unpack_from('<i', payload, 12)[0]
+    # 换算圈数: rev = pulse / 1760.0
+    # 换算角度: angle = pulse * 360.0 / 1760.0
 
 
+  ┌─────────────────────────────────────────────────────────┐
+  │ Type = 3  IMU数据 (数据就绪时发送)                       │
+  │ Payload大小 = 24 字节                                    │
+  │                                                          │
+  │ 偏移  大小    类型      说明                              │
+  │ 0     4B     float     加速度X (m/s^2)                   │
+  │ 4     4B     float     加速度Y (m/s^2)                   │
+  │ 8     4B     float     加速度Z (m/s^2)                   │
+  │ 12    4B     float     角速度X (rad/s)                   │
+  │ 16    4B     float     角速度Y (rad/s)                   │
+  │ 20    4B     float     角速度Z (rad/s)                   │
+  │                                                          │
+  │ Timestamp含义: IMU数据data_ready标志为真的瞬间            │
+  └─────────────────────────────────────────────────────────┘
 
-int LidarNode::lidar_start_with_freq(double target_hz) {
-    LOGI("Preparing to initialize YOLIDAR to %.1f Hz...", target_hz);
-    int fd = lidar_serial_port_->get_fd();
-
-
-    // 1. 强行下发停止扫描命令，确保雷达处于静默配置模式
-    if (cmd_stop_scan() < 0) return -1;
-
-    // 1. 下发停止命令前，先清空一次
-
-    
-    usleep(50000);
-    // 清空本地接收缓存指针，防止老旧残余点云数据干扰
-    read_pos_ = 0;
-    write_pos_ = 0;
-
-    // 2. 闭环获取当前频率并调节
-    bool freq_settled = false;
-    int retry_count = 0;
-    
-    while (!freq_settled && retry_count < 20) {
-        retry_count++;
-        
-        // 发送 0x0D 获取当前频率
-        if (cmd_get_current_freq() < 0) continue;
-        tcflush(fd, TCIOFLUSH);
-        LidarCommandResponseHeader header;
-        uint8_t answer_data[4]; // 频率内容的 AnswerData 是 4 字节 (图14)
-        
-        // 读取 7 字节头
-        if (!read_serial_sync_with_timeout(lidar_serial_port_.get(), reinterpret_cast<uint8_t*>(&header), 7, 200)) {
-            LOGE("Timeout waiting for current frequency response header");
-            continue;
-        }
-        
-        // 读取 4 字节内容
-        if (!read_serial_sync_with_timeout(lidar_serial_port_.get(), answer_data, 4, 100)) {
-            LOGE("Timeout waiting for current frequency data content");
-            continue;
-        }
-        
-        // 解析当前频率：F = AnswerData / 100.0 (小端序拼装，见图14)
-        uint32_t raw_ans = (answer_data[3] << 24) | (answer_data[2] << 16) | (answer_data[1] << 8) | answer_data[0];
-        double current_hz = static_cast<double>(raw_ans) / 100.0;
-        LOGI("Lidar current frequency feedback: %.2f Hz", current_hz);
-        
-        // 判断当前频率是否满足要求 (引入 0.05 容错区间)
-        if (std::abs(current_hz - target_hz) < 0.05) {
-            LOGI("Lidar frequency successfully matched target: %.1f Hz", target_hz);
-            freq_settled = true;
-            break;
-        }
-        
-        // 如果当前频率不符合，进行增减步进微调
-        if (current_hz < target_hz) {
-            if (target_hz - current_hz >= 1.0) {
-                LOGI("Frequency too low, sending command: +1Hz");
-                cmd_increase_freq_1hz();
-            } else {
-                LOGI("Frequency close to target, sending command: +0.1Hz");
-                cmd_increase_freq_01hz();
-            }
-        } else {
-            if (current_hz - target_hz >= 1.0) {
-                LOGI("Frequency too high, sending command: -1Hz");
-                cmd_decrease_freq_1hz();
-            } else {
-                LOGI("Frequency close to target, sending command: -0.1Hz");
-                cmd_decrease_freq_01hz();
-            }
-        }
-        usleep(40000); // 步进调整后等待 40ms 让雷达内部存储生效
-    }
-
-    if (!freq_settled) {
-        LOGE("Failed to configuration lidar frequency to %.1f Hz within retries", target_hz);
-        return -1;
-    }
-
-    // 3. 频率校验成功，下发开始扫描命令跑起点云
-    LOGI("Frequency adjustment lock. Starting laser scan output...");
-    if (cmd_start_scan() < 0) {
-        LOGE("Failed to send start scan command!");
-        return -1;
-    }
-
-    // 此时雷达应答开始信号后，将源源不断吐出 0xAA 0x55 的密集点云包
-    // 退出此函数，后续把 fd 挂回你的 epoll 反应堆，进入普通的 `lidar_rcv_msg_from_serial` 即可！
-    return 0;
-}
+  解析示例 (Python):
+    ax = struct.unpack_from('<f', payload, 0)[0]
+    ay = struct.unpack_from('<f', payload, 4)[0]
+    az = struct.unpack_from('<f', payload, 8)[0]
+    gx = struct.unpack_from('<f', payload, 12)[0]
+    gy = struct.unpack_from('<f', payload, 16)[0]
+    gz = struct.unpack_from('<f', payload, 20)[0]
 
 
-void LidarNode::lidar_init_config(int argc, char* argv[]){
-    struct option options[] = {
-        {"help",            no_argument,       nullptr, 1},
-        {"baud_rate",       required_argument, nullptr, 2},
-        {"ring_buffer_size",required_argument, nullptr, 3},
-        {"serial_port",     required_argument, nullptr, 4},
-        {nullptr, 0, nullptr, 0}
-    };
+  ┌─────────────────────────────────────────────────────────┐
+  │ Type = 4  雷达数据 (数据就绪时发送)                      │
+  │ Payload大小 = 2 + point_num × 8 字节                     │
+  │ 最大512个点，Payload最大 = 2 + 512×8 = 4098 字节         │
+  │                                                          │
+  │ 偏移  大小    类型        说明                            │
+  │ 0     2B     uint16_t   点数 (小端序，最大512)            │
+  │ 2     8B×N   struct     点数据，每个点:                   │
+  │       ├ 4B   float      角度 (度)                        │
+  │       └ 4B   float      距离 (mm)                        │
+  │                                                          │
+  │ 全量传输，不做截断                                       │
+  │ Timestamp含义: LiDAR数据data_ready标志为真的瞬间          │
+  └─────────────────────────────────────────────────────────┘
 
-    int option_id = 0;
-    optind = 0;
-
-    // 短选项：h 无参，b/r 带参数
-    while ((option_id = getopt_long(argc, argv, "hb:r:", options, nullptr)) != -1)
-    {
-        switch (option_id)
-        {
-            case 1:
-                // 帮助逻辑
-                break;
-            case 2:
-                lidar_baud_rate_ = atoi(optarg);
-                LOGI("Lidar config init baud_rate: %d", lidar_baud_rate_);
-                break;
-            case 3:
-                break;
-            case 4:
-                lidar_serial_port_name_ = optarg;
-                LOGI("Lidar config init serial_port: %s", lidar_serial_port_name_.c_str());
-                break;
-            case '?':
-                LOGE("Unknown option or missing argument");
-                break;
-            default:
-                LOGE("IMU config init unknown option: %d", option_id);
-                break;
-        }
-    }
-}
-
-int LidarNode::lidar_init(){
-    if (!lidar_serial_port_) return -1;
-    LOGI("lidar_init start ......");
-    
-    return 0;
-}
+  解析示例 (Python):
+    point_num = struct.unpack_from('<H', payload, 0)[0]
+    points = []
+    for k in range(point_num):
+        offset = 2 + k * 8
+        angle    = struct.unpack_from('<f', payload, offset)[0]
+        distance = struct.unpack_from('<f', payload, offset + 4)[0]
+        points.append((angle, distance))
 
 
-// 底层命令发送函数
-int LidarNode::send_command(uint8_t cmd_byte) {
-    if (!lidar_serial_port_) {
-        LOGE("Serial port not initialized");
-        return -1;
-    }
-    
-    uint8_t cmd[2] = {0xA5, cmd_byte};
-    int ret = lidar_serial_port_->write_data(cmd, 2);
-    if (ret < 0) {
-        LOGE("Failed to send command 0x%02X", cmd_byte);
-        return -1;
-    }
-    LOGI("Command 0xA5 0x%02X sent successfully", cmd_byte);
-    return 0;
-}
+四、帧总长度速查
+────────────────────────────────────────────────────────────
 
-void LidarNode::init_lidar_data_shm(void){
-    // 1. 动态竞争创建或链接雷达无锁共享内存页
-    lidar_shm_ptr_ = std::make_unique<SharedMemory>(SHARED_LIDAR_SHM_NAME, sizeof(SharedMemoryPoint));
+  Type  内容        Payload  帧总长度
+  ────  ──────      ───────  ────────
+  1     瞬时速度    16B      2+2+1+1+4+16+2+2 = 30B
+  2     总脉冲      16B      2+2+1+1+4+16+2+2 = 30B
+  3     IMU         24B      2+2+1+1+4+24+2+2 = 38B
+  4     雷达        2+8N B   2+2+1+1+4+(2+8N)+2+2 = 14+8N B
+      (N=点数，最大512个点，最大帧长 = 14+8×512 = 4110B)
 
-    if (lidar_shm_ptr_->init()) {  
-        lidar_data_shm_ptr_ = lidar_shm_ptr_->get_shared_data<SharedMemoryPoint>();
-        
-        if (lidar_data_shm_ptr_) {
-            // ? 【核心修复】：只有当自己是第一个创建者，才去初始化 slots 状态机
-            // 如果是消费者（如 slam_node）先启动并代建了，当前雷达作为链接者，绝不 placement new 覆盖它！
-            if (lidar_shm_ptr_->is_creator()) {
-                new (lidar_data_shm_ptr_) SharedMemoryPoint();
-                LOGI("共享内存由 Lidar 节点抢先开辟、洗涤，无锁三阶环形多缓冲区构造成功！");
-            } else {
-                LOGI("Lidar 节点作为连接者顺利切入现有的 Lidar 共享内存页。");
-            }
-        }
-    } else {
-        LOGE("雷达点云共享内存创建或夺权失败！");
-    }
-}
-void LidarNode::lidar_heartbeat(){
-    msg_info_t* msg_info = lidar_node_link_->msg_make_nodelink(sizeof(msg_info_t));
-    if (msg_info) {
-        msg_info->type = TYPE_HEARTBEAT_LIDAR_TO_MASTER;
-        msg_info->data.element_uint[0] = static_cast<uint64_t>(get_current_time_sec());
-        lidar_node_link_->msg_send_nodelink(KEY_HEARTBEAT_LIDAR_MASTER, *msg_info, sizeof(msg_info_t));
-        // ? 注意：如果你的 msg_make_nodelink 内部没有智能指针托管，
-        // 记得在这里检查是否需要自由释放空闲堆区（如 delete msg_info; 或 free(msg_info);）
-    }
-}
- 
-// 0x60: 开始扫描,输出点云数据
-int LidarNode::cmd_start_scan() {
-    return send_command(0x60);
-}
- 
-// 0x65: 停机,停止扫描
-int LidarNode::cmd_stop_scan() {
-    return send_command(0x65);
-}
- 
-// 0x90: 获取设备信息(型号、固件、硬件版本)
-int LidarNode::cmd_get_device_info() {
-    return send_command(0x90);
-}
- 
-// 0x92: 获取设备健康状态
-int LidarNode::cmd_get_health_status() {
-    return send_command(0x92);
-}
- 
-// 0x09: 增加0.1Hz当前设置的扫描频率
-int LidarNode::cmd_increase_freq_01hz() {
-    return send_command(0x09);
-}
- 
-// 0x0A: 减小0.1Hz当前设置的扫描频率
-int LidarNode::cmd_decrease_freq_01hz() {
-    return send_command(0x0A);
-}
- 
-// 0x0B: 增加1Hz当前设置的扫描频率
-int LidarNode::cmd_increase_freq_1hz() {
-    return send_command(0x0B);
-}
- 
-// 0x0C: 减小1Hz当前设置的扫描频率
-int LidarNode::cmd_decrease_freq_1hz() {
-    return send_command(0x0C);
-}
- 
-// 0x0D: 获取当前设置的扫描频率
-int LidarNode::cmd_get_current_freq() {
-    return send_command(0x0D);
-}
- 
-// 0x40: 设备软重启
-int LidarNode::cmd_soft_reset() {
-    return send_command(0x40);
-}
+
+五、Timestamp 打戳时机总结
+────────────────────────────────────────────────────────────
+
+  Type  数据        打戳时机                          main.c代码
+  ────  ──────      ──────────────────────────────    ──────────
+  1     瞬时速度    PID周期读取编码器数据的瞬间        enc_ts = HAL_GetTick()
+  2     总脉冲      同上(与Type=1同一时刻)            enc_ts = HAL_GetTick()
+  3     IMU         imu->data_ready 为真的瞬间         imu_ts = HAL_GetTick()
+  4     雷达        frame->data_ready 为真的瞬间       lidar_ts = HAL_GetTick()
+
+  关键: 时间戳由调用方在数据就绪的第一时间获取，而非组帧发送时。
+        这样不同传感器的Timestamp能真实反映各自的采集时刻，
+        便于上层建图时做时间对齐和插值。
+
+
+六、ESP32端 Python 伪代码 —— 完整解帧
+────────────────────────────────────────────────────────────
+
+  import struct
+
+  def crc16_modbus(data):
+      crc = 0xFFFF
+      for b in data:
+          crc ^= b
+          for _ in range(8):
+              if crc & 1:
+                  crc = (crc >> 1) ^ 0xA001
+              else:
+                  crc >>= 1
+      return crc
+
+  def parse_frame(buf):
+      # 1. 找帧头
+      if len(buf) < 13:
+          return None
+      if buf[0] != 0xAA or buf[1] != 0x55:
+          return None
+
+      # 2. 读Length (2字节小端序)
+      length = buf[2] | (buf[3] << 8)
+      if length < 8:             # 防御性检查: 最小length=8 (0 payload)
+          return None            # 非法帧
+      payload_len = length - 8   # 减去 Type(1) + Seq(1) + Timestamp(4) + CRC(2)
+      total_len = 2 + 2 + length + 2  # header + length字段 + (type+seq+ts+payload+crc) + tail
+      if len(buf) < total_len:
+          return None  # 帧不完整
+
+      # 3. 提取字段
+      type_val   = buf[4]
+      seq        = buf[5]
+      timestamp  = struct.unpack_from('<I', buf, 6)[0]   # uint32_t 毫秒时间戳(数据就绪瞬间)
+      payload    = buf[10 : 10 + payload_len]
+      crc_recv   = buf[10 + payload_len] | (buf[10 + payload_len + 1] << 8)
+      tail       = buf[10 + payload_len + 2 : 10 + payload_len + 4]
+
+      # 4. 校验帧尾
+      if tail != b'\x0d\x0a':
+          return None
+
+      # 5. 校验CRC (从Length到Payload末尾)
+      crc_calc = crc16_modbus(buf[2 : 10 + payload_len])
+      if crc_calc != crc_recv:
+          return None
+
+      # 6. 按Type解析Payload
+      if type_val == 1:
+          speeds = struct.unpack_from('<4f', payload)
+          return {'type': 'speed', 'seq': seq, 'ts': timestamp, 'data': speeds}
+      elif type_val == 2:
+          pulses = struct.unpack_from('<4i', payload)
+          return {'type': 'pulse', 'seq': seq, 'ts': timestamp, 'data': pulses}
+      elif type_val == 3:
+          ax, ay, az, gx, gy, gz = struct.unpack_from('<6f', payload)
+          return {'type': 'imu', 'seq': seq, 'ts': timestamp, 'data': (ax,ay,az,gx,gy,gz)}
+      elif type_val == 4:
+          point_num = struct.unpack_from('<H', payload, 0)[0]
+          points = []
+          for k in range(point_num):
+              angle, dist = struct.unpack_from('<ff', payload, 2 + k*8)
+              points.append((angle, dist))
+          return {'type': 'lidar', 'seq': seq, 'ts': timestamp, 'data': points}
+      else:
+          return None

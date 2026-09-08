@@ -9,6 +9,7 @@
 #include "uart.h"
 #include "imu.h"
 #include "lidar.h"
+#include "esp_proto.h"
 #include <string.h>
 
 #define WHEEL_DIAMETER_MM       65.0f
@@ -109,6 +110,7 @@ int main(void)
     uart4_init(230400);
     imu_init();
     lidar_init();
+    esp_proto_init();
     LOGW("system init ok");
     imu_calibrate();
     lidar_stop_scan();
@@ -171,9 +173,11 @@ int main(void)
         {
             const imu_data_t *imu = imu_get_data();
             if (imu->data_ready) {
+                uint32_t imu_ts = HAL_GetTick();
                 LOGI("IMU ax=%.3f ay=%.3f az=%.3f gx=%.3f gy=%.3f gz=%.3f",
                      imu->accel_x, imu->accel_y, imu->accel_z,
                      imu->gyro_x, imu->gyro_y, imu->gyro_z);
+                esp_proto_send_imu(imu_ts, imu);
                 ((imu_data_t *)imu)->data_ready = 0;
             }
         }
@@ -181,7 +185,9 @@ int main(void)
         {
             const lidar_frame_t *frame = lidar_get_frame();
             if (frame->data_ready) {
+                uint32_t lidar_ts = HAL_GetTick();
                 LOGI("Lidar %u pts", frame->point_num);
+                esp_proto_send_lidar(lidar_ts, frame);
                 ((lidar_frame_t *)frame)->data_ready = 0;
             }
         }
@@ -276,12 +282,20 @@ int main(void)
                      pid[i].error,
                      pid[i].p_out,
                      pid[i].i_out,
-                     pid[i].d_out,
                      pid[i].ff_out,
                      pid[i].output,
                      pwm_percent);
             } */
                 }
+
+            if (g_log_skip == 0) {
+                uint32_t enc_ts = HAL_GetTick();
+                int32_t total_pulse[MOTOR_COUNT];
+                for (int i = 0; i < MOTOR_COUNT; i++)
+                    total_pulse[i] = motor_get_encoder((motor_id_t)i);
+                esp_proto_send_speed(enc_ts, speed_filtered);
+                esp_proto_send_pulse(enc_ts, total_pulse);
+            }
 
             LED0_TOGGLE();
         }
