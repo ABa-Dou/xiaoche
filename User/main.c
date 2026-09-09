@@ -98,6 +98,7 @@ int main(void)
     int16_t pwm_value = 0;
     float pwm_percent = 0.0f;
     uint32_t last_tick = 0;
+    uint32_t last_imu_send = 0;
 
     HAL_Init();
     sys_stm32_clock_init(336, 8, 2, 7);
@@ -112,10 +113,12 @@ int main(void)
     lidar_init();
     esp_proto_init();
     LOGW("system init ok");
+    delay_ms(2000);
     imu_calibrate();
-    lidar_stop_scan();
-    delay_ms(100);
-    lidar_start_scan();
+    while (!lidar_set_freq(10.0)) {
+        LOGW("lidar init failed, retrying...");
+        delay_ms(1000);
+    }
     LOGW("lidar scan started");
     for (int i = 0; i < MOTOR_COUNT; i++) {
         motor_reset_encoder((motor_id_t)i);
@@ -173,11 +176,14 @@ int main(void)
         {
             const imu_data_t *imu = imu_get_data();
             if (imu->data_ready) {
-                uint32_t imu_ts = HAL_GetTick();
-                LOGI("IMU ax=%.3f ay=%.3f az=%.3f gx=%.3f gy=%.3f gz=%.3f",
-                     imu->accel_x, imu->accel_y, imu->accel_z,
-                     imu->gyro_x, imu->gyro_y, imu->gyro_z);
-                esp_proto_send_imu(imu_ts, imu);
+                uint32_t now = HAL_GetTick();
+                if (now - last_imu_send >= 10) {
+                    last_imu_send = now;
+                    LOGI("IMU ax=%.3f ay=%.3f az=%.3f gx=%.3f gy=%.3f gz=%.3f",
+                         imu->accel_x, imu->accel_y, imu->accel_z,
+                         imu->gyro_x, imu->gyro_y, imu->gyro_z);
+                    esp_proto_send_imu(now, imu);
+                }
                 ((imu_data_t *)imu)->data_ready = 0;
             }
         }

@@ -1,7 +1,20 @@
 #include "lidar.h"
 #include "easy_log.h"
 #include "uart.h"
+#include "delay.h"
 #include <string.h>
+#include <math.h>
+
+#define LIDAR_CMD_STOP_SCAN       0x65
+#define LIDAR_CMD_START_SCAN      0x60
+#define LIDAR_CMD_GET_FREQ        0x0D
+#define LIDAR_CMD_INC_FREQ_01HZ   0x09
+#define LIDAR_CMD_DEC_FREQ_01HZ   0x0A
+#define LIDAR_CMD_INC_FREQ_1HZ    0x0B
+#define LIDAR_CMD_DEC_FREQ_1HZ    0x0C
+
+#define LIDAR_FREQ_SETTLE_ERR     0.05
+#define LIDAR_FREQ_RETRY_MAX      20
 
 static uint8_t  s_ring_buf[LIDAR_RING_BUF_SIZE];
 static uint16_t s_ring_head = 0;
@@ -151,15 +164,150 @@ const lidar_frame_t *lidar_get_frame(void)
 void lidar_send_cmd(uint8_t cmd_byte)
 {
     uint8_t cmd[2] = {0xA5, cmd_byte};
+    LOGW("lidar send cmd: 0xA5 0x%02X", cmd_byte);
     uart4_send_buf(cmd, 2);
 }
 
 void lidar_start_scan(void)
 {
-    lidar_send_cmd(0x60);
+    lidar_send_cmd(LIDAR_CMD_START_SCAN);
 }
 
 void lidar_stop_scan(void)
 {
-    lidar_send_cmd(0x65);
+    lidar_send_cmd(LIDAR_CMD_STOP_SCAN);
+}
+
+static void lidar_clear_rx(void)
+{
+    __disable_irq();
+    g_uart4_rx_flag = 0;
+    g_uart4_rx_len = 0;
+    __enable_irq();
+    s_ring_head = 0;
+    s_ring_tail = 0;
+    s_ring_count = 0;
+    s_current_point_num = 0;
+}
+
+static uint8_t lidar_read_sync(uint8_t *buf, uint16_t len, uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+    uint16_t total = 0;
+
+    while (total < len) {
+        if ((HAL_GetTick() - start) >= timeout_ms) {
+            LOGW("lidar read_sync timeout: need=%u got=%u", len, total);
+            return 0;
+        }
+
+        if (g_uart4_rx_flag) {
+            __disable_irq();
+            uint16_t chunk_len = g_uart4_rx_len;
+            uint16_t copy_len = (len - total < chunk_len) ? (len - total) : chunk_len;
+            memcpy(buf + total, g_uart4_rx_buf, copy_len);
+            g_uart4_rx_flag = 0;
+            __enable_irq();
+            total += copy_len;
+            LOGW("lidar read chunk: chunk=%u copy=%u total=%u", chunk_len, copy_len, total);
+        }
+    }
+    return 1;
+}
+
+uint8_t lidar_set_freq(double target_hz)
+{
+    LOGW("lidar set freq to %.1f Hz", target_hz);
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        LOGW("lidar set freq attempt %d", attempt);
+
+        lidar_stop_scan();
+        delay_ms(50);
+        lidar_clear_rx();
+
+        uint8_t settled = 0;
+
+        for (int retry = 0; retry < LIDAR_FREQ_RETRY_MAX; retry++) {
+            lidar_send_cmd(LIDAR_CMD_GET_FREQ);
+
+            uint8_t resp[11];
+
+            if (!lidar_read_sync(resp, 11, 200)) {
+                LOGW("lidar get freq resp timeout, retry=%d", retry);
+                continue;
+            }
+
+            LOGW("lidar resp: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                 resp[0], resp[1], resp[2], resp[3], resp[4], resp[5],
+                 resp[6], resp[7], resp[8], resp[9], resp[10]);
+
+            uint8_t *ans_data = &resp[7];
+            uint32_t raw_ans = ((uint32_t)ans_data[3] << 24) |
+                               ((uint32_t)ans_data[2] << 16) |
+                               ((uint32_t)ans_data[1] << 8)  |
+                               ((uint32_t)ans_data[0]);
+            double current_hz = (double)raw_ans / 100.0;
+            LOGW("lidar cur freq: %.2f Hz", current_hz);
+
+            if (fabs(current_hz - target_hz) < LIDAR_FREQ_SETTLE_ERR) {
+                LOGW("lidar freq locked: %.1f Hz", target_hz);
+                settled = 1;
+                break;
+            }
+
+            if (current_hz < target_hz) {
+                if (target_hz - current_hz >= 1.0) {
+                    LOGW("lidar freq +1Hz");
+                    lidar_send_cmd(LIDAR_CMD_INC_FREQ_1HZ);
+                } else {
+                    LOGW("lidar freq +0.1Hz");
+                    lidar_send_cmd(LIDAR_CMD_INC_FREQ_01HZ);
+                }
+            } else {
+                if (current_hz - target_hz >= 1.0) {
+                    LOGW("lidar freq -1Hz");
+                    lidar_send_cmd(LIDAR_CMD_DEC_FREQ_1HZ);
+                } else {
+                    LOGW("lidar freq -0.1Hz");
+                    lidar_send_cmd(LIDAR_CMD_DEC_FREQ_01HZ);
+                }
+            }
+
+            delay_ms(40);
+            lidar_clear_rx();
+        }
+
+        if (!settled) {
+            LOGW("lidar freq not settled, retry attempt");
+            continue;
+        }
+
+        s_frame.data_ready = 0;
+        lidar_start_scan();
+
+        uint32_t wait_start = HAL_GetTick();
+        while (HAL_GetTick() - wait_start < 3000) {
+            if (g_uart4_rx_flag) {
+                __disable_irq();
+                uint16_t local_len = g_uart4_rx_len;
+                uint8_t local_buf[UART4_RX_BUF_SIZE];
+                memcpy(local_buf, g_uart4_rx_buf, local_len);
+                g_uart4_rx_flag = 0;
+                __enable_irq();
+                lidar_feed(local_buf, local_len);
+            }
+            lidar_parse_frames();
+            if (s_frame.data_ready) {
+                LOGW("lidar data ok, pts=%u", s_frame.point_num);
+                s_frame.data_ready = 0;
+                return 1;
+            }
+        }
+
+        LOGW("lidar data timeout, retry attempt");
+    }
+
+    LOGW("lidar init failed");
+    return 0;
 }

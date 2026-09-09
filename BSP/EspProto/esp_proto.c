@@ -5,7 +5,7 @@
 
 #define ESP_LOG_INTERVAL   50
 #define ESP_LIDAR_Q_DEPTH  4
-#define ESP_SMALL_Q_DEPTH  8
+#define ESP_SMALL_Q_DEPTH  32
 #define ESP_SMALL_MAX      40
 #define ESP_LIDAR_MAX      (ESP_FRAME_OVERHEAD + ESP_MAX_PAYLOAD)
 

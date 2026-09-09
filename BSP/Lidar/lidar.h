@@ -30,5 +30,6 @@ const lidar_frame_t *lidar_get_frame(void);
 void lidar_send_cmd(uint8_t cmd_byte);
 void lidar_start_scan(void);
 void lidar_stop_scan(void);
+uint8_t lidar_set_freq(double target_hz);
 
 #endif
