@@ -3,6 +3,7 @@
 
 #include "sys.h"
 
+#define UART2_RX_BUF_SIZE  256
 #define UART3_RX_BUF_SIZE  256
 #define UART4_RX_BUF_SIZE  512
 
@@ -17,6 +18,10 @@ void uart4_send_byte(uint8_t data);
 void uart2_send_buf(uint8_t *buf, uint16_t len);
 void uart3_send_buf(uint8_t *buf, uint16_t len);
 void uart4_send_buf(uint8_t *buf, uint16_t len);
+
+extern uint8_t  g_uart2_rx_buf[UART2_RX_BUF_SIZE];
+extern volatile uint16_t g_uart2_rx_len;
+extern volatile uint8_t  g_uart2_rx_flag;
 
 extern uint8_t  g_uart3_rx_buf[UART3_RX_BUF_SIZE];
 extern volatile uint16_t g_uart3_rx_len;

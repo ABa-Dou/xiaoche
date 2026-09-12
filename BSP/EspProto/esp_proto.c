@@ -27,6 +27,25 @@ static volatile uint8_t s_tx_type = 0;
 static volatile uint32_t s_tx_done_cnt = 0;
 static uint8_t s_payload_buf[ESP_MAX_PAYLOAD];
 
+#define ESP_RX_BUF_SIZE    256
+#define ESP_RX_BODY_MAX    240
+
+typedef enum {
+    RX_STATE_WAIT_H1 = 0,
+    RX_STATE_WAIT_H2,
+    RX_STATE_WAIT_LEN_L,
+    RX_STATE_WAIT_LEN_H,
+    RX_STATE_WAIT_BODY
+} rx_state_t;
+
+static uint8_t      s_rx_buf[ESP_RX_BUF_SIZE];
+static uint16_t     s_rx_idx = 0;
+static uint16_t     s_rx_body_len = 0;
+static rx_state_t   s_rx_state = RX_STATE_WAIT_H1;
+
+static esp_speed_cmd_t s_speed_cmd;
+static volatile uint8_t s_speed_cmd_ready = 0;
+
 static uint16_t crc16_calc(const uint8_t *data, uint16_t len)
 {
     uint16_t crc = 0xFFFF;
@@ -151,6 +170,12 @@ void esp_proto_init(void)
     s_lidar_ridx = 0;
     s_tx_busy = 0;
     s_tx_type = 0;
+
+    s_rx_idx = 0;
+    s_rx_body_len = 0;
+    s_rx_state = RX_STATE_WAIT_H1;
+    s_speed_cmd_ready = 0;
+    memset(&s_speed_cmd, 0, sizeof(s_speed_cmd));
 }
 
 void esp_proto_send_speed(uint32_t timestamp, const float speed_mm_s[MOTOR_COUNT])
@@ -199,4 +224,119 @@ void esp_proto_send_lidar(uint32_t timestamp, const lidar_frame_t *frame)
         LOGW("[LIDAR] S=%u TS=%u pts=%u plen=%u busy=%u done=%u", s_seq[3] - 1, timestamp,
              point_num, payload_len + ESP_FRAME_OVERHEAD, s_tx_busy, s_tx_done_cnt);
     }
+}
+
+void esp_proto_rx_feed(const uint8_t *data, uint16_t len)
+{
+    if (data == NULL || len == 0)
+        return;
+
+    for (uint16_t i = 0; i < len; i++) {
+        uint8_t b = data[i];
+
+        switch (s_rx_state) {
+        case RX_STATE_WAIT_H1:
+            if (b == ESP_FRAME_HEADER1) {
+                s_rx_buf[0] = b;
+                s_rx_idx = 1;
+                s_rx_state = RX_STATE_WAIT_H2;
+            }
+            break;
+
+        case RX_STATE_WAIT_H2:
+            if (b == ESP_FRAME_HEADER2) {
+                s_rx_buf[1] = b;
+                s_rx_idx = 2;
+                s_rx_state = RX_STATE_WAIT_LEN_L;
+            } else {
+                s_rx_state = RX_STATE_WAIT_H1;
+            }
+            break;
+
+        case RX_STATE_WAIT_LEN_L:
+            s_rx_buf[2] = b;
+            s_rx_idx = 3;
+            s_rx_state = RX_STATE_WAIT_LEN_H;
+            break;
+
+        case RX_STATE_WAIT_LEN_H:
+            s_rx_buf[3] = b;
+            s_rx_idx = 4;
+            s_rx_body_len = (uint16_t)s_rx_buf[2] | ((uint16_t)s_rx_buf[3] << 8);
+            if (s_rx_body_len < 8 || s_rx_body_len > ESP_RX_BODY_MAX) {
+                s_rx_state = RX_STATE_WAIT_H1;
+            } else {
+                s_rx_state = RX_STATE_WAIT_BODY;
+            }
+            break;
+
+        case RX_STATE_WAIT_BODY:
+            if (s_rx_idx < ESP_RX_BUF_SIZE) {
+                s_rx_buf[s_rx_idx] = b;
+            }
+            s_rx_idx++;
+
+            if (s_rx_idx >= (uint16_t)(4 + s_rx_body_len + 2)) {
+                uint16_t crc_off = 2 + s_rx_body_len;
+
+                if (s_rx_buf[crc_off + 2] == ESP_FRAME_TAIL1 &&
+                    s_rx_buf[crc_off + 3] == ESP_FRAME_TAIL2) {
+
+                    uint16_t crc_calc = crc16_calc(&s_rx_buf[2], s_rx_body_len);
+                    uint16_t crc_recv = (uint16_t)s_rx_buf[crc_off] |
+                                        ((uint16_t)s_rx_buf[crc_off + 1] << 8);
+
+                    if (crc_calc == crc_recv) {
+                        uint8_t type = s_rx_buf[4];
+                        if (type == ESP_TYPE_SPEED_CMD) {
+                            uint16_t payload_len = s_rx_body_len - 8;
+                            if (payload_len == sizeof(float) * MOTOR_COUNT) {
+                                memcpy(s_speed_cmd.speed_mm_s,
+                                       &s_rx_buf[10],
+                                       sizeof(s_speed_cmd.speed_mm_s));
+                                s_speed_cmd_ready = 1;
+
+                                float lf = s_speed_cmd.speed_mm_s[0];
+                                float rf = s_speed_cmd.speed_mm_s[1];
+                                float lr = s_speed_cmd.speed_mm_s[2];
+                                float rr = s_speed_cmd.speed_mm_s[3];
+                                const uint8_t *pl = &s_rx_buf[10];
+                                LOGI("[SPD_CMD] raw=%02X %02X %02X %02X %02X %02X %02X %02X "
+                                     "%02X %02X %02X %02X %02X %02X %02X %02X  "
+                                     "LF=%.2f RF=%.2f LR=%.2f RR=%.2f mm/s",
+                                     pl[0],  pl[1],  pl[2],  pl[3],
+                                     pl[4],  pl[5],  pl[6],  pl[7],
+                                     pl[8],  pl[9],  pl[10], pl[11],
+                                     pl[12], pl[13], pl[14], pl[15],
+                                     lf, rf, lr, rr);
+                            } else {
+                                LOGW("[SPD_CMD] bad payload_len=%u (expect %u)",
+                                     payload_len, (unsigned)sizeof(float) * MOTOR_COUNT);
+                            }
+                        }
+                    } else {
+                        LOGW("[SPD_CMD] CRC fail calc=%04X recv=%04X", crc_calc, crc_recv);
+                    }
+                }
+                s_rx_state = RX_STATE_WAIT_H1;
+            }
+            break;
+
+        default:
+            s_rx_state = RX_STATE_WAIT_H1;
+            break;
+        }
+    }
+}
+
+bool esp_proto_get_speed_cmd(esp_speed_cmd_t *cmd)
+{
+    if (cmd == NULL || !s_speed_cmd_ready)
+        return false;
+
+    __disable_irq();
+    memcpy(cmd, &s_speed_cmd, sizeof(*cmd));
+    s_speed_cmd_ready = 0;
+    __enable_irq();
+    return true;
 }

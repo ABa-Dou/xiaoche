@@ -32,8 +32,8 @@ add_compile_definitions(
     STM32F407xx
     USE_HAL_DRIVER
     #DEBUG_INFO
-    DEBUG_WARN
-    DEBUG_ERROR
+    #DEBUG_WARN
+    #DEBUG_ERROR
 )
 
 

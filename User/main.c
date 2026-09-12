@@ -22,7 +22,7 @@
 #define DEFAULT_KI              0.0f
 #define DEFAULT_KD              0.0f
 #define DEFAULT_FF_GAIN         1.1f
-#define DEFAULT_TGT_SPEED       150.0f
+#define DEFAULT_TGT_SPEED       0.0f
 #define DEFAULT_INTEGRAL_LIMIT  50.0f
 #define DEFAULT_INTEGRAL_SEP    50.0f
 #define DEFAULT_FILTER_ALPHA    0.30f
@@ -114,6 +114,10 @@ int main(void)
     esp_proto_init();
     LOGW("system init ok");
     delay_ms(2000);
+    while (!imu_set_freq(100)) {
+        LOGW("IMU set freq failed, retrying...");
+        delay_ms(500);
+    }
     imu_calibrate();
     while (!lidar_set_freq(10.0)) {
         LOGW("lidar init failed, retrying...");
@@ -171,6 +175,27 @@ int main(void)
             g_uart4_rx_flag = 0;
             __enable_irq();
             lidar_feed(local_buf4, local_len4);
+        }
+
+        if (g_uart2_rx_flag)
+        {
+            __disable_irq();
+            uint16_t local_len2 = g_uart2_rx_len;
+            uint8_t local_buf2[UART2_RX_BUF_SIZE];
+            memcpy(local_buf2, g_uart2_rx_buf, local_len2);
+            g_uart2_rx_flag = 0;
+            __enable_irq();
+            esp_proto_rx_feed(local_buf2, local_len2);
+
+            esp_speed_cmd_t spd_cmd;
+            if (esp_proto_get_speed_cmd(&spd_cmd)) {
+                for (int i = 0; i < MOTOR_COUNT; i++) {
+                    tgt_speed_mm_s[i] = spd_cmd.speed_mm_s[i];
+                }
+                LOGI("[CMD] speed: LF=%.1f RF=%.1f LR=%.1f RR=%.1f mm/s",
+                     spd_cmd.speed_mm_s[0], spd_cmd.speed_mm_s[1],
+                     spd_cmd.speed_mm_s[2], spd_cmd.speed_mm_s[3]);
+            }
         }
 
         {

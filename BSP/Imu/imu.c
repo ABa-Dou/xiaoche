@@ -183,3 +183,75 @@ void imu_calibrate(void)
 
     LOGW("IMU calibrate timeout");
 }
+
+uint8_t imu_set_freq(uint8_t hz)
+{
+    uint8_t cmd[7];
+    cmd[0] = IMU_FRAME_HEADER1;
+    cmd[1] = IMU_FRAME_HEADER2;
+    cmd[2] = 0x07;
+    cmd[3] = IMU_CMD_SET_FREQ;
+    cmd[4] = hz;
+    cmd[5] = 0x5F;
+    cmd[6] = cmd[0] + cmd[1] + cmd[2] + cmd[3] + cmd[4] + cmd[5];
+
+    LOGW("IMU set freq to %u Hz", hz);
+    uart3_send_buf(cmd, 7);
+    delay_ms(50);
+
+    s_imu_data.data_ready = 0;
+
+    uint32_t last_tick = 0;
+    uint8_t frame_cnt = 0;
+    uint32_t interval_sum = 0;
+    uint32_t expected_ms = 1000U / hz;
+    uint32_t min_ms = (expected_ms > 3) ? (expected_ms - 3) : 1;
+    uint32_t max_ms = expected_ms + 3;
+
+    uint32_t start = HAL_GetTick();
+    while (HAL_GetTick() - start < 3000)
+    {
+        if (g_uart3_rx_flag)
+        {
+            __disable_irq();
+            uint16_t local_len = g_uart3_rx_len;
+            uint8_t local_buf[UART3_RX_BUF_SIZE];
+            memcpy(local_buf, g_uart3_rx_buf, local_len);
+            g_uart3_rx_flag = 0;
+            __enable_irq();
+            imu_feed(local_buf, local_len);
+        }
+
+        imu_parse_frames();
+
+        if (s_imu_data.data_ready)
+        {
+            s_imu_data.data_ready = 0;
+            uint32_t now = HAL_GetTick();
+            if (last_tick != 0)
+            {
+                uint32_t interval = now - last_tick;
+                interval_sum += interval;
+                frame_cnt++;
+                LOGW("IMU frame interval: %lu ms", interval);
+            }
+            last_tick = now;
+
+            if (frame_cnt >= 5)
+            {
+                uint32_t avg_ms = interval_sum / frame_cnt;
+                LOGW("IMU avg interval: %lu ms (expect %lu ms)", avg_ms, expected_ms);
+                if (avg_ms >= min_ms && avg_ms <= max_ms)
+                {
+                    LOGW("IMU freq set ok ~%lu Hz", 1000U / avg_ms);
+                    return 1;
+                }
+                LOGW("IMU freq mismatch");
+                return 0;
+            }
+        }
+    }
+
+    LOGW("IMU set freq timeout");
+    return 0;
+}

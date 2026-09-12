@@ -6,8 +6,13 @@ static UART_HandleTypeDef huart2;
 static UART_HandleTypeDef huart3;
 static UART_HandleTypeDef huart4;
 static DMA_HandleTypeDef  hdma_usart2_tx;
+static DMA_HandleTypeDef  hdma_usart2_rx;
 static DMA_HandleTypeDef  hdma_usart3_rx;
 static DMA_HandleTypeDef  hdma_uart4_rx;
+
+uint8_t  g_uart2_rx_buf[UART2_RX_BUF_SIZE];
+volatile uint16_t g_uart2_rx_len = 0;
+volatile uint8_t  g_uart2_rx_flag = 0;
 
 uint8_t  g_uart3_rx_buf[UART3_RX_BUF_SIZE];
 volatile uint16_t g_uart3_rx_len = 0;
@@ -18,6 +23,31 @@ volatile uint16_t g_uart4_rx_len = 0;
 volatile uint8_t  g_uart4_rx_flag = 0;
 volatile uint32_t g_uart4_irq_cnt = 0;
 volatile uint32_t g_uart4_rxne_cnt = 0;
+
+static void uart2_dma_start(void)
+{
+    DMA_Stream_TypeDef *stream = DMA1_Stream5;
+
+    stream->CR &= ~DMA_SxCR_EN;
+    while (stream->CR & DMA_SxCR_EN) {}
+
+    DMA1->HIFCR = DMA_HIFCR_CTCIF5 | DMA_HIFCR_CHTIF5 |
+                  DMA_HIFCR_CTEIF5 | DMA_HIFCR_CDMEIF5 |
+                  DMA_HIFCR_CFEIF5;
+
+    stream->PAR  = (uint32_t)&(USART2->DR);
+    stream->M0AR = (uint32_t)g_uart2_rx_buf;
+    stream->NDTR = UART2_RX_BUF_SIZE;
+    stream->FCR  = 0;
+
+    stream->CR = (4U << 25)  |
+                 (2U << 16)  |
+                 DMA_SxCR_MINC;
+
+    stream->CR |= DMA_SxCR_EN;
+
+    USART2->CR3 |= USART_CR3_DMAR;
+}
 
 void uart2_init(uint32_t baudrate)
 {
@@ -55,6 +85,23 @@ void uart2_init(uint32_t baudrate)
 
     __HAL_LINKDMA(&huart2, hdmatx, hdma_usart2_tx);
 
+    hdma_usart2_rx.Instance                 = DMA1_Stream5;
+    hdma_usart2_rx.Init.Channel             = DMA_CHANNEL_4;
+    hdma_usart2_rx.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+    hdma_usart2_rx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_usart2_rx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_usart2_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart2_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart2_rx.Init.Mode                = DMA_NORMAL;
+    hdma_usart2_rx.Init.Priority            = DMA_PRIORITY_HIGH;
+    hdma_usart2_rx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    hdma_usart2_rx.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
+    hdma_usart2_rx.Init.MemBurst            = DMA_MBURST_SINGLE;
+    hdma_usart2_rx.Init.PeriphBurst         = DMA_PBURST_SINGLE;
+    HAL_DMA_Init(&hdma_usart2_rx);
+
+    __HAL_LINKDMA(&huart2, hdmarx, hdma_usart2_rx);
+
     huart2.Instance = USART2;
     huart2.Init.BaudRate = baudrate;
     huart2.Init.WordLength = UART_WORDLENGTH_8B;
@@ -70,6 +117,10 @@ void uart2_init(uint32_t baudrate)
 
     HAL_NVIC_SetPriority(USART2_IRQn, 2, 1);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
+
+    __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
+
+    uart2_dma_start();
 }
 
 static void uart3_dma_start(void)
@@ -320,6 +371,26 @@ void DMA1_Stream6_IRQHandler(void)
 
 void USART2_IRQHandler(void)
 {
+    if (USART2->SR & UART_FLAG_IDLE)
+    {
+        USART2->SR;
+        USART2->DR;
+
+        uint32_t ndtr = DMA1_Stream5->NDTR;
+        uint16_t rx_len = UART2_RX_BUF_SIZE - ndtr;
+
+        DMA1_Stream5->CR &= ~DMA_SxCR_EN;
+        USART2->CR3 &= ~USART_CR3_DMAR;
+
+        if (rx_len > 0 && rx_len < UART2_RX_BUF_SIZE)
+        {
+            g_uart2_rx_len = rx_len;
+            g_uart2_rx_flag = 1;
+        }
+
+        uart2_dma_start();
+    }
+
     HAL_UART_IRQHandler(&huart2);
 }
 
